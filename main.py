@@ -30,11 +30,10 @@ def _sanitize_for_print(s: str) -> str:
     """Sanitize string for printing in Windows console (cp1252 encoding)."""
     return s.encode('cp1252', errors='replace').decode('cp1252')
 
+
 import asyncio
-import os
-import sys
 import typer
-from typing import List
+from typing import List, Dict, Any
 
 from dotenv import load_dotenv
 
@@ -46,7 +45,7 @@ from src.schemas.models import Task, RunState, Goal
 
 load_dotenv()
 
-app = typer.Typer(help="AI Team Orchestrator - Milestone 1")
+app = typer.Typer(help="AI Team Orchestrator - Milestone 1 & 2")
 
 
 class AI_TEAM_ORCHESTRATOR:
@@ -56,7 +55,7 @@ class AI_TEAM_ORCHESTRATOR:
         # Load provider configuration from environment
         model_id = os.getenv("NVIDIA_MODEL_ID", "meta/llama3-70b-instruct")
         temp = float(os.getenv("NVIDIA_TEMPERATURE", "0.7"))
-        max_tok = int(os.getenv("NVIDIA_MAX_TOKENS", "1024"))
+        max_tok = int(os.getenv("NVIDIA_MAX_TOKENS", "8192"))
         config = ProviderConfig(
             model_id=model_id,
             temperature=temp,
@@ -74,13 +73,8 @@ class AI_TEAM_ORCHESTRATOR:
         # Initialize state
         self.state: RunState = RunState()
 
-    async def run(self, goal: str) -> None:
-        """Execute the full orchestration pipeline.
-
-        Args:
-            goal: The user's goal/request.
-        """
-        # Update progress
+    async def run(self, goal: str) -> Dict[str, Any]:
+        """Execute the full orchestration pipeline and return structured results."""
         print(f"\n[INFO] Processing goal: '{goal}'")
         self.state.current_goal = Goal(text=goal, id=self.state.run_id)
         self.state.status = "running"
@@ -92,10 +86,10 @@ class AI_TEAM_ORCHESTRATOR:
             plan_result = await self.planner.execute(goal)
         except ProviderError as e:
             print(f"[ERROR] Planner failed (provider error): {e}")
-            return
+            return {"error": str(e), "status": "failed"}
         except Exception as e:
             print(f"[ERROR] Planner failed: {e}")
-            return
+            return {"error": str(e), "status": "failed"}
 
         self.state.planner_output = plan_result
         self.state.total_tasks = len(plan_result.tasks)
@@ -104,8 +98,7 @@ class AI_TEAM_ORCHESTRATOR:
         for idx, task in enumerate(plan_result.tasks, 1):
             print(f"   {idx}. {_sanitize_for_print(task.description)}")
 
-        # Update current task
-        self.state.current_task = None if plan_result.tasks else None
+        self.state.current_task = None
 
         # Step 2: Worker executes tasks sequentially
         print("\n[INFO] Worker agent is executing tasks sequentially...")
@@ -144,7 +137,6 @@ class AI_TEAM_ORCHESTRATOR:
 
             # Store output for future tasks
             previous_outputs.append(worker_result.raw_output)
-
             completed_tasks.append(task)
 
             print(f"[OK] Task {idx} completed")
@@ -172,10 +164,8 @@ class AI_TEAM_ORCHESTRATOR:
             else:
                 print(f"[FAIL] Task rejected: {review_result.feedback}")
                 if review_result.retry_allowed:
-                    # Retry the task once
                     print("🔄 Retrying task...")
 
-                    # Reinject context on retry
                     if previous_outputs:
                         task.context = {
                             "previous_task_outputs": "\n\n".join(previous_outputs)
@@ -191,10 +181,10 @@ class AI_TEAM_ORCHESTRATOR:
                         print(f"[ERROR] Worker retry failed for task {task.task_id}: {e}")
                         task.status = "failed"
                         continue
+
                     task.output = retry_result.raw_output
                     task.attempts = 2
 
-                    # Validate retry
                     try:
                         retry_review = await self.reviewer.evaluate(
                             task,
@@ -212,7 +202,6 @@ class AI_TEAM_ORCHESTRATOR:
                     if retry_review.is_valid:
                         print("[OK] Task approved after retry")
                         task.status = "approved_after_retry"
-                        # Replace the last task in completed_tasks with the retried one
                         completed_tasks[-1] = task
                     else:
                         print(f"[FAIL] Task still rejected after retry: {retry_review.feedback}")
@@ -220,31 +209,58 @@ class AI_TEAM_ORCHESTRATOR:
                 else:
                     task.status = "rejected"
 
-        # Step 4: Generate final output
+        # Step 4: Generate final output summary metrics
         print("\n[INFO] Execution completed!")
         print("\n=== FINAL OUTPUT ===")
         print("\n[SUMMARY]")
         print(f"   Goal: {_sanitize_for_print(self.state.current_goal.text)}")
         print(f"   Total tasks: {self.state.total_tasks}")
-        print(f"   Completed tasks: {len([t for t in completed_tasks if t.status in ['completed', 'approved_after_retry']])}")
-        print(f"   Rejected tasks: {len([t for t in completed_tasks if t.status == 'rejected'])}")
+        completed_count = len([t for t in completed_tasks if t.status in ['completed', 'approved_after_retry']])
+        rejected_count = len([t for t in completed_tasks if t.status == 'rejected'])
+        print(f"   Completed tasks: {completed_count}")
+        print(f"   Rejected tasks: {rejected_count}")
 
         print("\n[TASK DETAILS]")
+        task_details_list = []
         for idx, task in enumerate(completed_tasks, 1):
             status_icon = "[OK]" if task.status in ["completed", "approved_after_retry"] else "[FAIL]"
             print(f"   {status_icon} {idx}. {_sanitize_for_print(task.description)}")
             print(f"      Attempts: {task.attempts}")
             if task.output:
                 print(f"      Output: {_sanitize_for_print(task.output[:150])}...")
+            
+            task_details_list.append({
+                "task_id": task.task_id,
+                "description": task.description,
+                "status": task.status,
+                "attempts": task.attempts,
+                "output": task.output
+            })
 
         self.state.status = "completed"
+
+        return {
+            "summary": {
+                "goal": goal,
+                "total_tasks": self.state.total_tasks,
+                "completed_tasks": completed_count,
+                "rejected_tasks": rejected_count,
+                "status": "completed"
+            },
+            "tasks": task_details_list
+        }
+
+
+def run_orchestrator(goal: str) -> dict:
+    """Synchronous entry point used by FastAPI backend."""
+    orchestrator = AI_TEAM_ORCHESTRATOR()
+    return asyncio.run(orchestrator.run(goal))
 
 
 @app.command()
 def execute(goal: str = typer.Argument(..., help="The user's goal or request")):
-    """Execute the AI team orchestration pipeline."""
-    orchestrator = AI_TEAM_ORCHESTRATOR()
-    asyncio.run(orchestrator.run(goal))
+    """Execute the AI team orchestration pipeline via CLI."""
+    run_orchestrator(goal)
 
 
 if __name__ == "__main__":
