@@ -1,2 +1,0 @@
-C:\Users\Lenovo\OneDrive\Desktop\neural-prompt\ai-team-orchestrator\README.md
-C:\Users\Lenovo\OneDrive\Desktop\neural-prompt\ai-team-orchestrator\requirements.txt
