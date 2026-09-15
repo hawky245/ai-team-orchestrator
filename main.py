@@ -33,17 +33,19 @@ def _sanitize_for_print(s: str) -> str:
 
 
 import asyncio
+import json
 import typer
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
+from fastapi import WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 
 from src.providers.base_provider import NvidiaNimProvider, ProviderConfig, ProviderError
 from src.agents.planner_agent import PlannerAgent
 from src.agents.worker_agent import WorkerAgent
 from src.agents.reviewer_agent import ReviewerAgent
-from src.schemas.models import Task, RunState, Goal
+from src.schemas.models import Task, RunState, Goal, WorkerResult
 from src.database import RunModel, TaskModel, SessionLocal
 
 load_dotenv()
@@ -56,9 +58,10 @@ class AI_TEAM_ORCHESTRATOR:
 
     def __init__(self) -> None:
         # Load provider configuration from environment
-        model_id = os.getenv("NVIDIA_MODEL_ID", "meta/llama3-70b-instruct")
-        temp = float(os.getenv("NVIDIA_TEMPERATURE", "0.7"))
-        max_tok = int(os.getenv("NVIDIA_MAX_TOKENS", "8192"))
+        # Generic LLM_ variables allow switching providers via .env only
+        model_id = os.getenv("LLM_MODEL_ID", "openai/gpt-6-astra")
+        temp = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+        max_tok = int(os.getenv("LLM_MAX_TOKENS", "8192"))
         config = ProviderConfig(
             model_id=model_id,
             temperature=temp,
@@ -76,8 +79,21 @@ class AI_TEAM_ORCHESTRATOR:
         # Initialize state
         self.state: RunState = RunState()
 
-    async def run(self, goal: str) -> Dict[str, Any]:
+    async def run(self, goal: str, websocket: WebSocket = None) -> Dict[str, Any]:
         """Execute the full orchestration pipeline and return structured results."""
+        # Helper to send events over websocket
+        async def send_event(event_type: str, data: dict = None):
+            if websocket is None:
+                return
+            event = {"type": event_type}
+            if data is not None:
+                event["data"] = data
+            try:
+                await websocket.send_text(json.dumps(event))
+            except Exception:
+                # Client disconnected — stop the pipeline rather than keep sending
+                raise WebSocketDisconnect()
+
         db = None
         run_model = None
         try:
@@ -91,17 +107,20 @@ class AI_TEAM_ORCHESTRATOR:
             db.add(run_model)
             db.commit()
 
+            await send_event("execution_started", {"goal": goal})
             print(f"\n[INFO] Processing goal: '{goal}'")
             self.state.current_goal = Goal(text=goal, id=self.state.run_id)
             self.state.status = "running"
             self.state.total_tasks = 0
 
             # Step 1: Planner decomposes the goal into tasks
+            await send_event("planning_started")
             print("[INFO] Planner agent is analyzing...")
             try:
                 plan_result = await self.planner.execute(goal)
             except ProviderError as e:
                 print(f"[ERROR] Planner failed (provider error): {e}")
+                await send_event("planning_failed", {"error": str(e)})
                 if run_model is not None:
                     run_model.status = "failed"
                     run_model.finished_at = datetime.utcnow()
@@ -109,12 +128,14 @@ class AI_TEAM_ORCHESTRATOR:
                 return {"error": str(e), "status": "failed"}
             except Exception as e:
                 print(f"[ERROR] Planner failed: {e}")
+                await send_event("planning_failed", {"error": str(e)})
                 if run_model is not None:
                     run_model.status = "failed"
                     run_model.finished_at = datetime.utcnow()
                     db.commit()
                 return {"error": str(e), "status": "failed"}
 
+            await send_event("planning_completed", {"task_count": len(plan_result.tasks)})
             self.state.planner_output = plan_result
             self.state.total_tasks = len(plan_result.tasks)
 
@@ -129,6 +150,7 @@ class AI_TEAM_ORCHESTRATOR:
             self.state.current_task = None
 
             # Step 2: Worker executes tasks sequentially
+            await send_event("execution_started_tasks")
             print("\n[INFO] Worker agent is executing tasks sequentially...")
 
             completed_tasks: List[Task] = []
@@ -143,34 +165,89 @@ class AI_TEAM_ORCHESTRATOR:
                         "previous_task_outputs": "\n\n".join(previous_outputs)
                     }
 
+                await send_event("task_started", {
+                    "task_index": idx,
+                    "task_id": task.task_id,
+                    "description": task.description
+                })
                 print(f"\n[TASK] Executing task {idx}/{self.state.total_tasks}: {_sanitize_for_print(task.description)}")
 
-                # Worker executes task
-                try:
-                    worker_result = await self.worker.execute(task)
-                except ProviderError as e:
-                    print(f"[ERROR] Worker failed (provider error) for task {task.task_id}: {e}")
-                    task.status = "failed"
-                    completed_tasks.append(task)
-                    continue
-                except Exception as e:
-                    print(f"[ERROR] Worker failed for task {task.task_id}: {e}")
-                    task.status = "failed"
-                    completed_tasks.append(task)
-                    continue
+                # Worker executes task with retry logic for JSON parsing errors
+                worker_result = None
+                last_parse_error = None
+
+                for attempt in range(1, 4):  # up to 3 attempts with backoff
+                    try:
+                        # WorkerAgent.execute() already validates the JSON output
+                        # via _parse_result() — no need to re-validate raw_output
+                        # here (raw_output is the extracted plain text, not JSON).
+                        worker_result = await self.worker.execute(task)
+                        # Success — break out of retry loop
+                        break
+
+                    except ProviderError as e:
+                        last_parse_error = e
+                        print(f"[RETRY] Worker ProviderError on attempt {attempt}/3 for task {task.task_id}: {e}")
+                        if attempt < 3:
+                            await asyncio.sleep(attempt)  # backoff before retry
+                            continue
+                        # All attempts exhausted
+                        print(f"[ERROR] Worker failed (provider error) for task {task.task_id}: {e}")
+                        await send_event("task_worker_failed", {
+                            "task_index": idx,
+                            "task_id": task.task_id,
+                            "error": str(e)
+                        })
+                        task.status = "failed"
+                        completed_tasks.append(task)
+                        # skip to next task
+                        worker_result = None
+                        break
+
+                    except Exception as e:
+                        last_parse_error = e
+                        print(f"[RETRY] Worker unexpected error on attempt {attempt}/3 for task {task.task_id}: {type(e).__name__}: {e}")
+                        if attempt < 3:
+                            await asyncio.sleep(attempt)  # backoff before retry
+                            continue
+                        print(f"[ERROR] Worker failed for task {task.task_id}: {e}")
+                        await send_event("task_worker_failed", {
+                            "task_index": idx,
+                            "task_id": task.task_id,
+                            "error": str(e)
+                        })
+                        task.status = "failed"
+                        completed_tasks.append(task)
+                        # skip to next task
+                        worker_result = None
+                        break
+
+                # Only proceed if worker_result was successfully obtained
+                if worker_result is None:
+                    continue  # task already marked failed inside the retry loop
 
                 task.output = worker_result.raw_output
-                task.attempts = 1
+                task.attempts = attempt if 'attempt' in dir() else 1
                 task.status = "completed"
 
                 # Store output for future tasks
                 previous_outputs.append(worker_result.raw_output)
                 completed_tasks.append(task)
 
+                await send_event("task_worker_completed", {
+                    "task_index": idx,
+                    "task_id": task.task_id,
+                    "output": worker_result.raw_output,
+                    "attempts": task.attempts
+                })
                 print(f"[OK] Task {idx} completed")
                 print(f"   Output: {worker_result.raw_output[:100]}...")
 
                 # Step 3: Reviewer validates task output
+                await send_event("task_review_started", {
+                    "task_index": idx,
+                    "task_id": task.task_id
+                })
                 print("[INFO] Reviewer agent is validating...")
 
                 try:
@@ -180,16 +257,36 @@ class AI_TEAM_ORCHESTRATOR:
                     )
                 except ProviderError as e:
                     print(f"[ERROR] Reviewer failed (provider error) for task {task.task_id}: {e}")
+                    await send_event("task_review_failed", {
+                        "task_index": idx,
+                        "task_id": task.task_id,
+                        "error": str(e)
+                    })
                     task.status = "failed"
                     continue
                 except Exception as e:
                     print(f"[ERROR] Reviewer failed for task {task.task_id}: {e}")
+                    await send_event("task_review_failed", {
+                        "task_index": idx,
+                        "task_id": task.task_id,
+                        "error": str(e)
+                    })
                     task.status = "failed"
                     continue
 
                 if review_result.is_valid:
+                    await send_event("task_review_passed", {
+                        "task_index": idx,
+                        "task_id": task.task_id,
+                        "feedback": review_result.feedback
+                    })
                     print("[OK] Task approved by reviewer")
                 else:
+                    await send_event("task_review_failed", {
+                        "task_index": idx,
+                        "task_id": task.task_id,
+                        "feedback": review_result.feedback
+                    })
                     print(f"[FAIL] Task rejected: {review_result.feedback}")
                     if review_result.retry_allowed:
                         print("🔄 Retrying task...")
@@ -203,10 +300,20 @@ class AI_TEAM_ORCHESTRATOR:
                             retry_result = await self.worker.execute(task)
                         except ProviderError as e:
                             print(f"[ERROR] Worker retry failed (provider error) for task {task.task_id}: {e}")
+                            await send_event("task_retry_worker_failed", {
+                                "task_index": idx,
+                                "task_id": task.task_id,
+                                "error": str(e)
+                            })
                             task.status = "failed"
                             continue
                         except Exception as e:
                             print(f"[ERROR] Worker retry failed for task {task.task_id}: {e}")
+                            await send_event("task_retry_worker_failed", {
+                                "task_index": idx,
+                                "task_id": task.task_id,
+                                "error": str(e)
+                            })
                             task.status = "failed"
                             continue
 
@@ -220,21 +327,46 @@ class AI_TEAM_ORCHESTRATOR:
                             )
                         except ProviderError as e:
                             print(f"[ERROR] Reviewer retry failed (provider error) for task {task.task_id}: {e}")
+                            await send_event("task_retry_review_failed", {
+                                "task_index": idx,
+                                "task_id": task.task_id,
+                                "error": str(e)
+                            })
                             task.status = "failed"
                             continue
                         except Exception as e:
                             print(f"[ERROR] Reviewer retry failed for task {task.task_id}: {e}")
+                            await send_event("task_retry_review_failed", {
+                                "task_index": idx,
+                                "task_id": task.task_id,
+                                "error": str(e)
+                            })
                             task.status = "failed"
                             continue
 
                         if retry_review.is_valid:
+                            await send_event("task_retry_review_passed", {
+                                "task_index": idx,
+                                "task_id": task.task_id,
+                                "feedback": retry_review.feedback
+                            })
                             print("[OK] Task approved after retry")
                             task.status = "approved_after_retry"
                             completed_tasks[-1] = task
                         else:
+                            await send_event("task_retry_review_failed", {
+                                "task_index": idx,
+                                "task_id": task.task_id,
+                                "feedback": retry_review.feedback
+                            })
                             print(f"[FAIL] Task still rejected after retry: {retry_review.feedback}")
                             task.status = "rejected"
                     else:
+                        await send_event("task_review_failed", {
+                            "task_index": idx,
+                            "task_id": task.task_id,
+                            "feedback": review_result.feedback
+                        })
                         task.status = "rejected"
 
                 # Save task to database
@@ -255,6 +387,7 @@ class AI_TEAM_ORCHESTRATOR:
                     run_model.rejected_tasks += 1
                 db.commit()
 
+            await send_event("execution_completed_tasks")
             # Step 4: Generate final output summary metrics
             print("\n[INFO] Execution completed!")
             print("\n=== FINAL OUTPUT ===")
@@ -290,6 +423,28 @@ class AI_TEAM_ORCHESTRATOR:
             run_model.status = "completed"
             db.commit()
 
+            # Emit a definitive run_completed event carrying the final polished output
+            # (the last completed task's output is the end product of the pipeline).
+            final_output = ""
+            if task_details_list:
+                last_task = task_details_list[-1]
+                if last_task.get("status") in ("completed", "approved_after_retry"):
+                    final_output = last_task.get("output", "") or ""
+            await send_event("run_completed", {
+                "final_output": final_output
+            })
+
+            await send_event("execution_completed", {
+                "summary": {
+                    "goal": goal,
+                    "total_tasks": self.state.total_tasks,
+                    "completed_tasks": completed_count,
+                    "rejected_tasks": rejected_count,
+                    "status": "completed"
+                },
+                "tasks": task_details_list
+            })
+
             return {
                 "summary": {
                     "goal": goal,
@@ -310,6 +465,7 @@ class AI_TEAM_ORCHESTRATOR:
                     db.commit()
                 except:
                     pass
+            await send_event("execution_failed", {"error": str(e)})
             raise
         finally:
             if db is not None:

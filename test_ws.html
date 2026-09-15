@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<body>
+    <h2>Live Execution Stream</h2>
+    <button onclick="startStream()">Start Orchestrator</button>
+    <pre id="log" style="background: #f4f4f4; padding: 10px; margin-top: 10px;"></pre>
+
+    <script>
+        function startStream() {
+            const log = document.getElementById("log");
+            log.innerHTML = "Connecting...\n";
+            
+            // Connect to your new FastAPI WebSocket endpoint
+            const ws = new WebSocket("ws://127.0.0.1:8000/ws/execute");
+            
+            ws.onopen = () => {
+                log.innerHTML += "Connected! Sending goal...\n";
+                // Send the JSON payload Claude expects
+                ws.send(JSON.stringify({ goal: "Write a 2-sentence story about a robot." }));
+            };
+            
+            ws.onmessage = (event) => {
+                // Print the real-time stream to the screen
+                log.innerHTML += event.data + "\n";
+            };
+            
+            ws.onclose = () => {
+                log.innerHTML += "\nConnection closed.";
+            };
+        }
+    </script>
+</body>
+</html>

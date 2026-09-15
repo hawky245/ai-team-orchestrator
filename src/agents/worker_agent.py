@@ -39,14 +39,8 @@ Rules:
 5. No text before or after the JSON object
 6. The entire response must be parseable as JSON
 7. If any text precedes the opening {, the generation fails instantly
-
-Required format:
-{
-    "raw_output": "Your task result here - can contain multiline strings, code, SQL, or Markdown properly escaped as JSON strings",
-    "artifacts": []
-}
-
-Important: The raw_output field can contain any text content including newlines, code blocks, SQL queries, etc. This content must be properly escaped as a JSON string (e.g., newlines as \\n, quotes as \\\", etc.). Do not include unescaped raw content that would break JSON parsing.
+8. Do not use code fences, markdown, or any formatting - output ONLY raw JSON
+9. The raw_output field can contain any text content including newlines, code blocks, SQL queries, etc. This content must be properly escaped as a JSON string (e.g., newlines as \\n, quotes as \\\", etc.). Do not include unescaped raw content that would break JSON parsing.
 """
 
     def __init__(self, provider: AbstractLLMProvider) -> None:
