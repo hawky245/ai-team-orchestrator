@@ -57,6 +57,7 @@ class Task(BaseModel):
     task_id: str
     description: str
     dependencies: List[str] = Field(default_factory=list)
+    is_parallel: bool = False
     context: Dict[str, Any] = Field(default_factory=dict)
     output: Optional[str] = None
     artifacts: List[Artifact] = Field(default_factory=list)
@@ -100,6 +101,7 @@ class PlannerOutput(BaseModel):
     raw_text: str
     tasks: List[Task] = Field(default_factory=list)
     plan_summary: str = ""
+    execution_order: str = "dag"
 
 
 class WorkerOutput(BaseModel):

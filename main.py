@@ -19,7 +19,7 @@ Planner Agent
 ↓
 Task List
 ↓
-Worker Agent (executes tasks sequentially)
+Worker Agent (executes independent tasks concurrently, respecting dependencies)
 ↓
 Reviewer Agent (validates each task output)
 ↓
@@ -41,7 +41,13 @@ from datetime import datetime
 from fastapi import WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 
-from src.providers.base_provider import NvidiaNimProvider, ProviderConfig, ProviderError
+from src.providers.base_provider import (
+    NvidiaNimProvider,
+    ProviderConfig,
+    ProviderError,
+    ModelExhaustedError,
+)
+from src.utils.retry import compute_delay
 from src.agents.planner_agent import PlannerAgent
 from src.agents.worker_agent import WorkerAgent
 from src.agents.reviewer_agent import ReviewerAgent
@@ -51,6 +57,49 @@ from src.database import RunModel, TaskModel, SessionLocal
 load_dotenv()
 
 app = typer.Typer(help="AI Team Orchestrator - Milestone 1 & 2")
+
+
+def effective_dependencies(task: Task, known_ids: set) -> List[str]:
+    """Task IDs that must finish before `task` may start.
+
+    ``is_parallel`` short-circuits the list: the planner explicitly vouches
+    for the task being independent, so it becomes eligible immediately.
+    """
+    if task.is_parallel:
+        return []
+    return [d for d in task.dependencies if d in known_ids and d != task.task_id]
+
+
+def plan_execution_waves(
+    tasks: List[Task], execution_order: str = "dag"
+) -> List[List[Task]]:
+    """Group tasks into dependency waves.
+
+    Every task inside one wave is mutually independent and can be executed
+    concurrently; a wave only starts after all tasks of the previous waves
+    finished. Tasks referencing unknown IDs or themselves are not blocked by
+    them; a dependency cycle is broken by running the leftovers together in a
+    final wave instead of deadlocking.
+    """
+    by_id = {t.task_id: t for t in tasks}
+    order = [t.task_id for t in tasks]
+    known_ids = set(order)
+
+    if execution_order == "sequential":
+        return [[by_id[tid]] for tid in order]
+
+    deps = {tid: effective_dependencies(by_id[tid], known_ids) for tid in order}
+    remaining = list(order)
+    done: set = set()
+    waves: List[List[Task]] = []
+    while remaining:
+        ready = [tid for tid in remaining if all(d in done for d in deps[tid])]
+        if not ready:
+            ready = list(remaining)
+        waves.append([by_id[tid] for tid in ready])
+        done.update(ready)
+        remaining = [tid for tid in remaining if tid not in done]
+    return waves
 
 
 class AI_TEAM_ORCHESTRATOR:
@@ -81,18 +130,25 @@ class AI_TEAM_ORCHESTRATOR:
 
     async def run(self, goal: str, websocket: WebSocket = None) -> Dict[str, Any]:
         """Execute the full orchestration pipeline and return structured results."""
-        # Helper to send events over websocket
+        # Helper to send events over websocket.
+        # Milestone 8: concurrent workers emit frames from multiple coroutines;
+        # Starlette WebSockets do not tolerate interleaved sends, so every
+        # write is serialized through this lock.
+        send_lock = asyncio.Lock()
+
         async def send_event(event_type: str, data: dict = None):
             if websocket is None:
                 return
             event = {"type": event_type}
             if data is not None:
                 event["data"] = data
-            try:
-                await websocket.send_text(json.dumps(event))
-            except Exception:
-                # Client disconnected — stop the pipeline rather than keep sending
-                raise WebSocketDisconnect()
+            payload = json.dumps(event)
+            async with send_lock:
+                try:
+                    await websocket.send_text(payload)
+                except Exception:
+                    # Client disconnected — stop the pipeline rather than keep sending
+                    raise WebSocketDisconnect()
 
         db = None
         run_model = None
@@ -149,21 +205,52 @@ class AI_TEAM_ORCHESTRATOR:
 
             self.state.current_task = None
 
-            # Step 2: Worker executes tasks sequentially
+            # Step 2: Workers execute tasks concurrently wherever the
+            # dependency graph allows (Milestone 8: multi-agent collaboration)
             await send_event("execution_started_tasks")
-            print("\n[INFO] Worker agent is executing tasks sequentially...")
 
             completed_tasks: List[Task] = []
-            previous_outputs: List[str] = []
+            outputs_by_id: Dict[str, str] = {}
+            known_ids = {t.task_id for t in plan_result.tasks}
+            task_index_by_id = {
+                t.task_id: i for i, t in enumerate(plan_result.tasks, 1)
+            }
 
-            for idx, task in enumerate(plan_result.tasks, 1):
+            waves = plan_execution_waves(
+                plan_result.tasks, plan_result.execution_order
+            )
+            widest = max((len(w) for w in waves), default=0)
+            print(
+                f"\n[INFO] Executing {self.state.total_tasks} tasks across "
+                f"{len(waves)} wave(s); max concurrent workers: {widest}..."
+            )
+
+            async def run_task(task: Task, idx: int) -> None:
+                """Run one task's full worker -> reviewer pipeline."""
                 self.state.current_task = task
 
-                # Inject outputs from previous tasks as context
-                if previous_outputs:
+                # Inject outputs of this task's dependencies as context.
+                # Independent tasks neither wait for nor see unrelated output.
+                dep_notes = [
+                    outputs_by_id.get(dep_id)
+                    or f"[dependency {dep_id} produced no usable output]"
+                    for dep_id in effective_dependencies(task, known_ids)
+                ]
+                if dep_notes:
                     task.context = {
-                        "previous_task_outputs": "\n\n".join(previous_outputs)
+                        **task.context,
+                        "previous_task_outputs": "\n\n".join(dep_notes),
                     }
+
+                async def emit_tool_execution(
+                    tool_name: str, arguments: dict
+                ) -> None:
+                    """Broadcast this worker's tool call just before it executes."""
+                    await send_event("tool_execution", {
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "task_id": task.task_id,
+                    })
 
                 await send_event("task_started", {
                     "task_index": idx,
@@ -176,20 +263,56 @@ class AI_TEAM_ORCHESTRATOR:
                 worker_result = None
                 last_parse_error = None
 
+                async def emit_task_retry(attempt: int, delay: float, exc: Exception) -> None:
+                    """Broadcast provider-level transient-error retries in real time."""
+                    await send_event("task_retry", {
+                        "task_id": task.task_id,
+                        "attempt": attempt + 1,
+                        "reason": f"{type(exc).__name__}: {exc} (backoff {delay:.1f}s)",
+                    })
+
                 for attempt in range(1, 4):  # up to 3 attempts with backoff
                     try:
                         # WorkerAgent.execute() already validates the JSON output
                         # via _parse_result() — no need to re-validate raw_output
                         # here (raw_output is the extracted plain text, not JSON).
-                        worker_result = await self.worker.execute(task)
+                        worker_result = await self.worker.execute(
+                            task,
+                            on_tool_call=emit_tool_execution,
+                            on_retry=emit_task_retry,
+                        )
                         # Success — break out of retry loop
+                        break
+
+                    except ModelExhaustedError as e:
+                        # Primary model retries (and configured fallback) spent:
+                        # mark the task failed with structured state and move on.
+                        print(f"[FALLBACK] Model exhausted for task {task.task_id}: {e}")
+                        await send_event("task_fallback_exhausted", {
+                            "task_id": task.task_id,
+                            "task_index": idx,
+                            "status": "failed_fallback",
+                            "primary_model": e.primary_model,
+                            "fallback_model": e.fallback_model,
+                            "attempts": e.attempts,
+                            "error": str(e.last_error),
+                        })
+                        task.status = "failed"
+                        completed_tasks.append(task)
+                        worker_result = None
                         break
 
                     except ProviderError as e:
                         last_parse_error = e
                         print(f"[RETRY] Worker ProviderError on attempt {attempt}/3 for task {task.task_id}: {e}")
                         if attempt < 3:
-                            await asyncio.sleep(attempt)  # backoff before retry
+                            delay = compute_delay(attempt, base_delay=1.0)
+                            await send_event("task_retry", {
+                                "task_id": task.task_id,
+                                "attempt": attempt + 1,
+                                "reason": f"{type(e).__name__}: {e}",
+                            })
+                            await asyncio.sleep(delay)
                             continue
                         # All attempts exhausted
                         print(f"[ERROR] Worker failed (provider error) for task {task.task_id}: {e}")
@@ -208,7 +331,13 @@ class AI_TEAM_ORCHESTRATOR:
                         last_parse_error = e
                         print(f"[RETRY] Worker unexpected error on attempt {attempt}/3 for task {task.task_id}: {type(e).__name__}: {e}")
                         if attempt < 3:
-                            await asyncio.sleep(attempt)  # backoff before retry
+                            delay = compute_delay(attempt, base_delay=1.0)
+                            await send_event("task_retry", {
+                                "task_id": task.task_id,
+                                "attempt": attempt + 1,
+                                "reason": f"{type(e).__name__}: {e}",
+                            })
+                            await asyncio.sleep(delay)
                             continue
                         print(f"[ERROR] Worker failed for task {task.task_id}: {e}")
                         await send_event("task_worker_failed", {
@@ -224,14 +353,14 @@ class AI_TEAM_ORCHESTRATOR:
 
                 # Only proceed if worker_result was successfully obtained
                 if worker_result is None:
-                    continue  # task already marked failed inside the retry loop
+                    return  # task already marked failed inside the retry loop
 
                 task.output = worker_result.raw_output
-                task.attempts = attempt if 'attempt' in dir() else 1
+                task.attempts = attempt
                 task.status = "completed"
 
-                # Store output for future tasks
-                previous_outputs.append(worker_result.raw_output)
+                # Store output so dependent tasks can consume it
+                outputs_by_id[task.task_id] = worker_result.raw_output
                 completed_tasks.append(task)
 
                 await send_event("task_worker_completed", {
@@ -263,7 +392,7 @@ class AI_TEAM_ORCHESTRATOR:
                         "error": str(e)
                     })
                     task.status = "failed"
-                    continue
+                    return
                 except Exception as e:
                     print(f"[ERROR] Reviewer failed for task {task.task_id}: {e}")
                     await send_event("task_review_failed", {
@@ -272,7 +401,7 @@ class AI_TEAM_ORCHESTRATOR:
                         "error": str(e)
                     })
                     task.status = "failed"
-                    continue
+                    return
 
                 if review_result.is_valid:
                     await send_event("task_review_passed", {
@@ -291,13 +420,12 @@ class AI_TEAM_ORCHESTRATOR:
                     if review_result.retry_allowed:
                         print("🔄 Retrying task...")
 
-                        if previous_outputs:
-                            task.context = {
-                                "previous_task_outputs": "\n\n".join(previous_outputs)
-                            }
-
                         try:
-                            retry_result = await self.worker.execute(task)
+                            retry_result = await self.worker.execute(
+                                task,
+                                on_tool_call=emit_tool_execution,
+                                on_retry=emit_task_retry,
+                            )
                         except ProviderError as e:
                             print(f"[ERROR] Worker retry failed (provider error) for task {task.task_id}: {e}")
                             await send_event("task_retry_worker_failed", {
@@ -306,7 +434,7 @@ class AI_TEAM_ORCHESTRATOR:
                                 "error": str(e)
                             })
                             task.status = "failed"
-                            continue
+                            return
                         except Exception as e:
                             print(f"[ERROR] Worker retry failed for task {task.task_id}: {e}")
                             await send_event("task_retry_worker_failed", {
@@ -315,7 +443,7 @@ class AI_TEAM_ORCHESTRATOR:
                                 "error": str(e)
                             })
                             task.status = "failed"
-                            continue
+                            return
 
                         task.output = retry_result.raw_output
                         task.attempts = 2
@@ -333,7 +461,7 @@ class AI_TEAM_ORCHESTRATOR:
                                 "error": str(e)
                             })
                             task.status = "failed"
-                            continue
+                            return
                         except Exception as e:
                             print(f"[ERROR] Reviewer retry failed for task {task.task_id}: {e}")
                             await send_event("task_retry_review_failed", {
@@ -342,7 +470,7 @@ class AI_TEAM_ORCHESTRATOR:
                                 "error": str(e)
                             })
                             task.status = "failed"
-                            continue
+                            return
 
                         if retry_review.is_valid:
                             await send_event("task_retry_review_passed", {
@@ -352,7 +480,6 @@ class AI_TEAM_ORCHESTRATOR:
                             })
                             print("[OK] Task approved after retry")
                             task.status = "approved_after_retry"
-                            completed_tasks[-1] = task
                         else:
                             await send_event("task_retry_review_failed", {
                                 "task_index": idx,
@@ -386,6 +513,16 @@ class AI_TEAM_ORCHESTRATOR:
                 else:
                     run_model.rejected_tasks += 1
                 db.commit()
+
+            for wave_no, wave in enumerate(waves, 1):
+                if len(wave) > 1:
+                    print(
+                        f"[WAVE {wave_no}] Running {len(wave)} tasks concurrently: "
+                        + ", ".join(t.task_id for t in wave)
+                    )
+                await asyncio.gather(
+                    *(run_task(t, task_index_by_id[t.task_id]) for t in wave)
+                )
 
             await send_event("execution_completed_tasks")
             # Step 4: Generate final output summary metrics
@@ -423,13 +560,24 @@ class AI_TEAM_ORCHESTRATOR:
             run_model.status = "completed"
             db.commit()
 
-            # Emit a definitive run_completed event carrying the final polished output
-            # (the last completed task's output is the end product of the pipeline).
+            # Emit a definitive run_completed event carrying the final polished output.
+            # The end product is the *latest* completed task in plan order (with a
+            # parallel engine, append order inside a wave is nondeterministic, and
+            # the last task is often the review/polish task which may be rejected
+            # or return an empty output). Fall back to the last planned task's
+            # output if nothing completed.
+            def _plan_rank(detail: Dict[str, Any]) -> int:
+                return task_index_by_id.get(detail.get("task_id"), 0)
+
             final_output = ""
-            if task_details_list:
-                last_task = task_details_list[-1]
-                if last_task.get("status") in ("completed", "approved_after_retry"):
-                    final_output = last_task.get("output", "") or ""
+            completed = [
+                t for t in task_details_list
+                if t.get("status") in ("completed", "approved_after_retry")
+            ]
+            if completed:
+                final_output = max(completed, key=_plan_rank).get("output", "") or ""
+            elif task_details_list:
+                final_output = max(task_details_list, key=_plan_rank).get("output", "") or ""
             await send_event("run_completed", {
                 "final_output": final_output
             })

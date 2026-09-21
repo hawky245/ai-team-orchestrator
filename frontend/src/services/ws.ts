@@ -15,6 +15,8 @@ interface UseWebSocketProps {
   onTaskWorkerComplete?: (taskIndex: number, taskId: string, output: string, attempts: number) => void;
   onTaskReviewPassed?: (taskIndex: number, taskId: string, feedback: string) => void;
   onTaskReviewFailed?: (taskIndex: number, taskId: string, feedback: string) => void;
+  onToolExecute?: (toolName: string, args: Record<string, unknown>, taskId?: string) => void;
+  onTaskRetry?: (taskId: string, attempt: number, reason: string) => void;
   onError?: (error: string) => void;
   onConnectionChange?: (isConnected: boolean) => void;
 }
@@ -23,12 +25,15 @@ export function useWebSocket({
   onEvent,
   onExecutionStart,
   onExecutionComplete,
+  onRunComplete,
   onPlanningStart,
   onPlanningComplete,
   onTaskStart,
   onTaskWorkerComplete,
   onTaskReviewPassed,
   onTaskReviewFailed,
+  onToolExecute,
+  onTaskRetry,
   onError,
   onConnectionChange
 }: UseWebSocketProps = {}) {
@@ -37,6 +42,11 @@ export function useWebSocket({
   const wsRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnection] = useState<boolean>(false);
   const reconnectAttemptsRef = useRef<number>(0);
+  // True once a run has finished on this connection. The server closes the
+  // socket after every run, so a close/reconnect that happens after a run is
+  // complete is normal — not a lost connection. This flag suppresses the
+  // spurious "connection error" toast in that case.
+  const runCompletedRef = useRef<boolean>(false);
   const maxReconnectAttempts = 5;
   const baseDelay = 1000;
 
@@ -45,9 +55,9 @@ export function useWebSocket({
   // recreate the connect function and re-run the effect on every render).
   const propsRef = useRef<UseWebSocketProps>({} as UseWebSocketProps);
   propsRef.current = {
-    onEvent, onExecutionStart, onExecutionComplete, onPlanningStart,
+    onEvent, onExecutionStart, onExecutionComplete, onRunComplete, onPlanningStart,
     onPlanningComplete, onTaskStart, onTaskWorkerComplete, onTaskReviewPassed,
-    onTaskReviewFailed, onError, onConnectionChange
+    onTaskReviewFailed, onToolExecute, onTaskRetry, onError, onConnectionChange
   };
 
   useEffect(() => {
@@ -56,12 +66,13 @@ export function useWebSocket({
     const connect = () => {
       if (cancelled) return;
 
-      const newWs = new WebSocket('ws://127.0.0.1:8000/ws/execute');
+      const newWs = new WebSocket('ws://127.0.0.1:8100/ws/execute');
 
       newWs.onopen = () => {
         console.log('WebSocket connected');
         setIsConnection(true);
         reconnectAttemptsRef.current = 0;
+        runCompletedRef.current = false;
         propsRef.current.onConnectionChange?.(true);
       };
 
@@ -75,9 +86,11 @@ export function useWebSocket({
               propsRef.current.onExecutionStart?.(data.data.goal);
               break;
             case 'execution_completed':
+              runCompletedRef.current = true;
               propsRef.current.onExecutionComplete?.(data.data.summary, data.data.tasks);
               break;
             case 'run_completed':
+              runCompletedRef.current = true;
               propsRef.current.onRunComplete?.(data.data.final_output);
               break;
             case 'planning_started':
@@ -111,6 +124,12 @@ export function useWebSocket({
                 data.data.feedback
               );
               break;
+            case 'tool_execution':
+              propsRef.current.onToolExecute?.(data.data.tool_name, data.data.arguments, data.data.task_id);
+              break;
+            case 'task_retry':
+              propsRef.current.onTaskRetry?.(data.data.task_id, data.data.attempt, data.data.reason);
+              break;
             case 'error':
               propsRef.current.onError?.(data.data.message);
               break;
@@ -124,7 +143,11 @@ export function useWebSocket({
       newWs.onclose = () => {
         console.log('WebSocket disconnected');
         setIsConnection(false);
-        propsRef.current.onConnectionChange?.(false);
+        // The server closes the socket after every run completes, so a close
+        // here after a finished run is expected — not a lost connection.
+        if (!runCompletedRef.current) {
+          propsRef.current.onConnectionChange?.(false);
+        }
 
         // Only reconnect if we haven't hit the cap and the component is still mounted
         if (reconnectAttemptsRef.current < maxReconnectAttempts) {
@@ -136,9 +159,14 @@ export function useWebSocket({
 
       newWs.onerror = (error) => {
         console.error('WebSocket error:', error);
-        propsRef.current.onError?.('WebSocket connection error');
-        setIsConnection(false);
-        propsRef.current.onConnectionChange?.(false);
+        if (!runCompletedRef.current) {
+          propsRef.current.onError?.('WebSocket connection error');
+          propsRef.current.onConnectionChange?.(false);
+        } else {
+          // Run already finished — the server closing the socket is normal,
+          // so don't surface a spurious "connection error" toast.
+          setIsConnection(false);
+        }
       };
 
       wsRef.current = newWs;

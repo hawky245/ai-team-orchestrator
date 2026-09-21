@@ -95,3 +95,21 @@ export interface RunCompletedEvent extends OrchestratorEvent {
     final_output: string;
   };
 }
+
+export interface ToolExecutionEvent extends OrchestratorEvent {
+  type: 'tool_execution';
+  data: {
+    tool_name: string;
+    arguments: Record<string, unknown>;
+    task_id?: string;
+  };
+}
+
+export interface TaskRetryEvent extends OrchestratorEvent {
+  type: 'task_retry';
+  data: {
+    task_id: string;
+    attempt: number;
+    reason: string;
+  };
+}

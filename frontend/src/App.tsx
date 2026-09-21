@@ -32,6 +32,117 @@ interface ExecutionLogEntry {
   data: Record<string, unknown>;
 }
 
+const formatLogEntry = (entry: ExecutionLogEntry) => {
+  switch (entry.type) {
+    case 'task_started':
+      return {
+        type: 'info',
+        content: `[TASK ${entry.data.taskIndex}] Starting: ${entry.data.description}`
+      };
+    case 'task_worker_completed':
+      return {
+        type: 'success',
+        content: `[TASK ${entry.data.taskIndex}] Completed (attempt ${entry.data.attempts}): ${(entry.data.output as string).substring(0, 100)}${(entry.data.output as string).length > 100 ? '...' : ''}`
+      };
+    case 'task_review_passed':
+      return {
+        type: 'success',
+        content: `[TASK ${entry.data.taskIndex}] Review PASSED: ${entry.data.feedback}`
+      };
+    case 'task_review_failed':
+      return {
+        type: 'error',
+        content: `[TASK ${entry.data.taskIndex}] Review FAILED: ${entry.data.feedback}`
+      };
+    case 'tool_execution':
+      return {
+        type: 'tool',
+        content: `[TOOL${entry.data.taskId ? ` ${entry.data.taskId}` : ''}] ${entry.data.toolName} running with ${JSON.stringify(entry.data.args)}`
+      };
+    case 'task_retry':
+      return {
+        type: 'retry',
+        content: `[RETRY] Task ${entry.data.taskId} -> attempt ${entry.data.attempt}: ${entry.data.reason}`
+      };
+    default:
+      return {
+        type: 'log',
+        content: JSON.stringify(entry.data)
+      };
+  }
+};
+
+// Defined at module scope so its identity is stable across App renders —
+// memo() actually skips re-renders when only finalOutput changes.
+const ExecutionLogStream = memo(({ logs, isExecuting }: { logs: ExecutionLogEntry[]; isExecuting: boolean }) => (
+  <ScrollArea className="h-[400px] w-full bg-muted/50 rounded p-4 space-y-2">
+    {logs.length === 0 && !isExecuting ? (
+      <p className="text-muted-foreground text-center py-8">
+        No execution logs yet. Submit a goal to see live updates.
+      </p>
+    ) : (
+      <>
+        {logs.map((entry, index) => {
+          const formatted = formatLogEntry(entry);
+          return (
+            <div key={index} className={`px-3 py-2 rounded-lg border-l-4 ${
+              formatted.type === 'error' ? 'border-destructive bg-destructive/10' :
+              formatted.type === 'success' ? 'border-success bg-success/10' :
+              formatted.type === 'info' ? 'border-primary bg-primary/10' :
+              formatted.type === 'tool' ? 'border-warning bg-warning/10' :
+              formatted.type === 'retry' ? 'border-warning bg-warning/10 animate-pulse' :
+              'border-muted bg-muted/5'
+            }`}>
+              <div className="flex items-start gap-2">
+                <div className={`flex-shrink-0 h-2.5 w-2.5 rounded-full ${
+                  formatted.type === 'error' ? 'bg-destructive' :
+                  formatted.type === 'success' ? 'bg-success' :
+                  formatted.type === 'info' ? 'bg-primary' :
+                  formatted.type === 'tool' ? 'bg-warning' :
+                  formatted.type === 'retry' ? 'bg-warning' :
+                  'bg-muted'
+                }`}></div>
+                <div className="text-sm whitespace-pre-wrap font-mono">{formatted.content}</div>
+              </div>
+            </div>
+          );
+        })}
+      </>
+    )}
+  </ScrollArea>
+));
+
+// Module scope for the same reason: re-renders only when output/isExecuting change.
+const FinalResultPanel = memo(({ output, isExecuting }: { output: string | null; isExecuting: boolean }) => {
+  return (
+    <Card className="border-2 border-primary/40 bg-gradient-to-b from-primary/5 to-background">
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-2">
+          <div className={`h-2.5 w-2.5 rounded-full ${isExecuting ? 'bg-warning animate-pulse' : 'bg-success'}`} />
+          <CardTitle className="text-lg font-semibold text-primary">Final Result</CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {output && output.trim() ? (
+          <div className="bg-background/80 rounded-lg p-4 border border-border">
+            <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground">
+              {output}
+            </p>
+          </div>
+        ) : (
+          <div className="bg-background/50 rounded-lg p-4 border border-dashed border-border">
+            <p className="text-sm text-muted-foreground text-center py-2">
+              {isExecuting
+                ? 'Working on the final result...'
+                : 'No final output yet. Submit a goal to see the final result here.'}
+            </p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+});
+
 export default function App() {
   const [inputValue, setInputValue] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
@@ -99,6 +210,24 @@ export default function App() {
         }
       ]);
     },
+    onToolExecute: (toolName: string, args: Record<string, unknown>, taskId?: string) => {
+      setExecutionLogs(prev => [
+        ...prev,
+        {
+          type: 'tool_execution',
+          data: { toolName, args, taskId }
+        }
+      ]);
+    },
+    onTaskRetry: (taskId: string, attempt: number, reason: string) => {
+      setExecutionLogs(prev => [
+        ...prev,
+        {
+          type: 'task_retry',
+          data: { taskId, attempt, reason }
+        }
+      ]);
+    },
     onError: (error: string) => {
       setIsExecuting(false);
       toast({
@@ -138,17 +267,25 @@ export default function App() {
     try {
       setIsExecuting(true);
       setExecutionLogs([]);
-      await ApiService.executeGoal(inputValue);
+      const result = await ApiService.executeGoal(inputValue);
+      // The API path is non-streaming, so populate the final output from the
+      // last completed task's output (same source the WS path uses).
+      const tasks: TaskDetail[] = result?.tasks ?? [];
+      const lastCompleted = tasks
+        .filter(t => t.status === 'completed' || t.status === 'approved_after_retry')
+        .pop();
+      setFinalOutput(lastCompleted?.output?.trim() || null);
       setIsExecuting(false);
       // Refresh runs list
       fetchRuns();
       toast({
-        title: "Execution Started",
-        description: `Started execution for: "${inputValue}"`,
+        title: "Execution Complete",
+        description: `Completed with ${result?.summary?.completed_tasks ?? 0} successful tasks`,
       });
       setInputValue('');
     } catch (error: unknown) {
       setIsExecuting(false);
+      setFinalOutput(null);
       toast({
         title: "Error",
         description: "Failed to start execution",
@@ -164,93 +301,6 @@ export default function App() {
     setExecutionLogs([]);
     setInputValue('');
   };
-
-  const formatLogEntry = (entry: ExecutionLogEntry) => {
-    switch (entry.type) {
-      case 'task_started':
-        return {
-          type: 'info',
-          content: `[TASK ${entry.data.taskIndex}] Starting: ${entry.data.description}`
-        };
-      case 'task_worker_completed':
-        return {
-          type: 'success',
-          content: `[TASK ${entry.data.taskIndex}] Completed (attempt ${entry.data.attempts}): ${(entry.data.output as string).substring(0, 100)}${(entry.data.output as string).length > 100 ? '...' : ''}`
-        };
-      case 'task_review_passed':
-        return {
-          type: 'success',
-          content: `[TASK ${entry.data.taskIndex}] Review PASSED: ${entry.data.feedback}`
-        };
-      case 'task_review_failed':
-        return {
-          type: 'error',
-          content: `[TASK ${entry.data.taskIndex}] Review FAILED: ${entry.data.feedback}`
-        };
-      default:
-        return {
-          type: 'log',
-          content: JSON.stringify(entry.data)
-        };
-    }
-  };
-
-  // Memoized so the log stream never re-renders when finalOutput changes.
-  const ExecutionLogStream = memo(({ logs, isExecuting }: { logs: ExecutionLogEntry[]; isExecuting: boolean }) => (
-    <ScrollArea className="h-[400px] w-full bg-muted/50 rounded p-4 space-y-2">
-      {logs.length === 0 && !isExecuting ? (
-        <p className="text-muted-foreground text-center py-8">
-          No execution logs yet. Submit a goal to see live updates.
-        </p>
-      ) : (
-        <>
-          {logs.map((entry, index) => {
-            const formatted = formatLogEntry(entry);
-            return (
-              <div key={index} className={`px-3 py-2 rounded-lg border-l-4 ${
-                formatted.type === 'error' ? 'border-destructive bg-destructive/10' :
-                formatted.type === 'success' ? 'border-success bg-success/10' :
-                formatted.type === 'info' ? 'border-primary bg-primary/10' :
-                'border-muted bg-muted/5'
-              }`}>
-                <div className="flex items-start gap-2">
-                  <div className={`flex-shrink-0 h-2.5 w-2.5 rounded-full ${
-                    formatted.type === 'error' ? 'bg-destructive' :
-                    formatted.type === 'success' ? 'bg-success' :
-                    formatted.type === 'info' ? 'bg-primary' :
-                    'bg-muted'
-                  }`}></div>
-                  <div className="text-sm whitespace-pre-wrap">{formatted.content}</div>
-                </div>
-              </div>
-            );
-          })}
-        </>
-      )}
-    </ScrollArea>
-  ));
-
-  // Memoized so it only re-renders when the final output actually changes.
-  const FinalResultPanel = memo(({ output }: { output: string | null }) => {
-    if (!output) return null;
-    return (
-      <Card className="border-2 border-primary/40 bg-gradient-to-b from-primary/5 to-background">
-        <CardHeader className="pb-3">
-          <div className="flex items-center gap-2">
-            <div className="h-2.5 w-2.5 rounded-full bg-success animate-pulse" />
-            <CardTitle className="text-lg font-semibold text-primary">Final Result</CardTitle>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="bg-background/80 rounded-lg p-4 border border-border">
-            <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground">
-              {output}
-            </p>
-          </div>
-        </CardContent>
-      </Card>
-    );
-  });
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -322,7 +372,7 @@ export default function App() {
 
           {/* Final Result Panel (always present but hidden when not available) */}
           <div className="lg:col-span-3">
-            <FinalResultPanel output={finalOutput} />
+            <FinalResultPanel output={finalOutput} isExecuting={isExecuting} />
           </div>
         </div>
 

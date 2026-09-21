@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from src.providers.base_provider import AbstractLLMProvider, ProviderResponse
 from src.schemas.models import Task, WorkerResult
+from src.tools.worker_tools import TOOL_REGISTRY, WORKER_TOOLS
 from src.utils.json_parser import _extract_and_parse_json
 
 
@@ -41,13 +42,22 @@ Rules:
 7. If any text precedes the opening {, the generation fails instantly
 8. Do not use code fences, markdown, or any formatting - output ONLY raw JSON
 9. The raw_output field can contain any text content including newlines, code blocks, SQL queries, etc. This content must be properly escaped as a JSON string (e.g., newlines as \\n, quotes as \\\", etc.). Do not include unescaped raw content that would break JSON parsing.
+10. If tools (e.g. web_search, read_file) are available, you may call them to gather information first. After all tool results are returned, produce ONLY the final JSON object as your answer.
 """
 
     def __init__(self, provider: AbstractLLMProvider) -> None:
         self.provider = provider
 
-    async def execute(self, task: Task) -> WorkerResult:
-        """Execute the given task and return a WorkerResult."""
+    async def execute(self, task: Task, on_tool_call=None, on_retry=None) -> WorkerResult:
+        """Execute the given task and return a WorkerResult.
+
+        on_tool_call: optional async callback(tool_name, arguments) invoked
+        right before a tool is executed, used to broadcast tool_execution
+        events over the websocket.
+        on_retry: optional async callback(attempt, delay, error) invoked by
+        the provider before each transient-error retry, used to broadcast
+        task_retry events so the UI can show recovery in real time.
+        """
 
         prompt = (
             f"Task Description:\n{task.description}\n\n"
@@ -56,11 +66,22 @@ Rules:
             f"Produce the deliverable for this task."
         )
 
-        response: ProviderResponse = await self.provider.generate(
-            system_prompt=self.SYSTEM_PROMPT,
-            user_prompt=prompt,
-            schema=WORKER_SCHEMA,
-        )
+        if hasattr(self.provider, "generate_with_tools"):
+            response: ProviderResponse = await self.provider.generate_with_tools(
+                system_prompt=self.SYSTEM_PROMPT,
+                user_prompt=prompt,
+                tools=WORKER_TOOLS,
+                tool_registry=TOOL_REGISTRY,
+                on_tool_call=on_tool_call,
+                on_retry=on_retry,
+            )
+        else:
+            response: ProviderResponse = await self.provider.generate(
+                system_prompt=self.SYSTEM_PROMPT,
+                user_prompt=prompt,
+                schema=WORKER_SCHEMA,
+                on_retry=on_retry,
+            )
 
         print("\n=== RAW MODEL RESPONSE ===")
         print(response.content)

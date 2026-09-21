@@ -23,13 +23,18 @@ PLANNER_SCHEMA = {
                 "properties": {
                     "task_id": {"type": "string"},
                     "description": {"type": "string"},
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "dependencies": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "is_parallel": {"type": "boolean"},
                     "context": {"type": "object"},
                 },
-                "required": ["task_id", "description", "dependencies", "context"],
+                "required": ["task_id", "description"],
             },
         },
         "execution_order": {"type": "string"},
@@ -49,17 +54,25 @@ You MUST respond with ONLY a single JSON object that matches this exact schema (
 {
   "summary": "Brief summary of the overall plan",
   "tasks": [
-    {"task_id": "t1", "description": "Specific, actionable task description", "dependencies": [], "context": {}},
-    {"task_id": "t2", "description": "Next task that may depend on t1", "dependencies": ["t1"], "context": {}},
-    ...
+    {"task_id": "t1", "description": "Specific, actionable task description", "depends_on": [], "is_parallel": false, "context": {}},
+    {"task_id": "t2", "description": "Independent task, needs no other output", "depends_on": [], "is_parallel": true, "context": {}},
+    {"task_id": "t3", "description": "Task that combines t1 and t2", "depends_on": ["t1", "t2"], "is_parallel": false, "context": {}}
   ],
-  "execution_order": "sequential"
+  "execution_order": "dag"
 }
 
 RULES:
 - Generate EXACTLY 3 to 7 tasks (not less, not more).
 - Tasks should be concrete and specific (not vague).
-- Use sequential dependencies when one task needs another's output.
+- "depends_on" lists the task IDs whose output this task needs before it can start.
+- The orchestrator runs tasks CONCURRENTLY whenever their depends_on allow it:
+  give a task "depends_on": [] (and optionally "is_parallel": true) ONLY when it
+  genuinely does not need any other task's output.
+- Add depends_on entries for every task that builds on, polishes, or reviews
+  another task's output.
+- Set "execution_order" to "dag" when the plan contains a dependency structure
+  (the usual case). Use "sequential" only when EVERY task requires the output
+  of the task directly before it.
 - Each task_id must be unique and follow pattern t1, t2, t3...
 - DO NOT include any explanations, reasoning, markdown, code fences, or text before/after the JSON.
 - Your entire response must be valid JSON that can be parsed directly.
@@ -82,6 +95,7 @@ RULES:
             raw_text=response.content,
             tasks=plan.tasks,
             plan_summary=plan.summary,
+            execution_order=plan.execution_order,
         )
         return planner_out
 
@@ -103,19 +117,32 @@ RULES:
             if not description:
                 raise ValueError(f"Task {idx} has empty description")
 
-            dependencies = t.get("dependencies", [])
-            if not isinstance(dependencies, list):
-                dependencies = []
+            # Accept both spellings of the dependency list: the new
+            # `depends_on` (Milestone 8 spec) and legacy `dependencies`.
+            raw_deps = []
+            seen_deps = set()
+            for key in ("depends_on", "dependencies"):
+                value = t.get(key, [])
+                if isinstance(value, list):
+                    for d in value:
+                        if isinstance(d, str) and d not in seen_deps:
+                            seen_deps.add(d)
+                            raw_deps.append(d)
 
             context = t.get("context", {})
             if not isinstance(context, dict):
                 context = {}
 
+            is_parallel = t.get("is_parallel", False)
+            if not isinstance(is_parallel, bool):
+                is_parallel = bool(is_parallel)
+
             tasks.append(
                 Task(
                     task_id=task_id,
                     description=description,
-                    dependencies=dependencies,
+                    dependencies=raw_deps,
+                    is_parallel=is_parallel,
                     context=context,
                 )
             )
