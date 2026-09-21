@@ -19,6 +19,7 @@ class TaskStatus(str, Enum):
     """Lifecycle status of a single task."""
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
+    REQUIRES_USER_INPUT = "requires_user_input"
     COMPLETED = "completed"
     APPROVED = "approved"
     REJECTED = "rejected"
@@ -29,6 +30,7 @@ class RunStatus(str, Enum):
     """Lifecycle status of a full orchestration run."""
     PENDING = "pending"
     RUNNING = "running"
+    REQUIRES_USER_INPUT = "requires_user_input"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -58,6 +60,7 @@ class Task(BaseModel):
     description: str
     dependencies: List[str] = Field(default_factory=list)
     is_parallel: bool = False
+    requires_user_input: bool = False
     context: Dict[str, Any] = Field(default_factory=dict)
     output: Optional[str] = None
     artifacts: List[Artifact] = Field(default_factory=list)
@@ -88,6 +91,7 @@ class ReviewResult(BaseModel):
     issues: List[str] = Field(default_factory=list)
     suggestions: List[str] = Field(default_factory=list)
     retry_allowed: bool = True
+    needs_user_input: bool = False
     score: float = 0.0
 
 

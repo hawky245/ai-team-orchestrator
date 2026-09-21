@@ -17,6 +17,9 @@ interface UseWebSocketProps {
   onTaskReviewFailed?: (taskIndex: number, taskId: string, feedback: string) => void;
   onToolExecute?: (toolName: string, args: Record<string, unknown>, taskId?: string) => void;
   onTaskRetry?: (taskId: string, attempt: number, reason: string) => void;
+  onTaskRequiresInput?: (taskId: string, taskIndex: number, question: string) => void;
+  onTaskResumed?: (taskId: string, feedback: string) => void;
+  onTaskInputTimeout?: (taskId: string, reason: string) => void;
   onError?: (error: string) => void;
   onConnectionChange?: (isConnected: boolean) => void;
 }
@@ -34,6 +37,9 @@ export function useWebSocket({
   onTaskReviewFailed,
   onToolExecute,
   onTaskRetry,
+  onTaskRequiresInput,
+  onTaskResumed,
+  onTaskInputTimeout,
   onError,
   onConnectionChange
 }: UseWebSocketProps = {}) {
@@ -57,7 +63,9 @@ export function useWebSocket({
   propsRef.current = {
     onEvent, onExecutionStart, onExecutionComplete, onRunComplete, onPlanningStart,
     onPlanningComplete, onTaskStart, onTaskWorkerComplete, onTaskReviewPassed,
-    onTaskReviewFailed, onToolExecute, onTaskRetry, onError, onConnectionChange
+    onTaskReviewFailed, onToolExecute, onTaskRetry,
+    onTaskRequiresInput, onTaskResumed, onTaskInputTimeout,
+    onError, onConnectionChange
   };
 
   useEffect(() => {
@@ -130,6 +138,15 @@ export function useWebSocket({
             case 'task_retry':
               propsRef.current.onTaskRetry?.(data.data.task_id, data.data.attempt, data.data.reason);
               break;
+            case 'task_requires_input':
+              propsRef.current.onTaskRequiresInput?.(data.data.task_id, data.data.task_index, data.data.question);
+              break;
+            case 'task_resumed':
+              propsRef.current.onTaskResumed?.(data.data.task_id, data.data.feedback);
+              break;
+            case 'task_input_timeout':
+              propsRef.current.onTaskInputTimeout?.(data.data.task_id, data.data.reason);
+              break;
             case 'error':
               propsRef.current.onError?.(data.data.message);
               break;
@@ -193,8 +210,22 @@ export function useWebSocket({
     }
   };
 
+  // Milestone 9: reply to a paused task on the same open connection.
+  const sendFeedback = (taskId: string, feedback: string) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'user_feedback',
+        data: { task_id: taskId, feedback }
+      }));
+    } else {
+      onError?.('WebSocket is not connected');
+    }
+  };
+
   return {
     sendMessage,
+    sendFeedback,
     isConnected,
     reconnectAttempts: reconnectAttemptsRef.current
   };

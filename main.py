@@ -58,6 +58,9 @@ load_dotenv()
 
 app = typer.Typer(help="AI Team Orchestrator - Milestone 1 & 2")
 
+# How long a task may sit in REQUIRES_USER_INPUT before it is failed (M9).
+FEEDBACK_TIMEOUT_SECONDS = 15 * 60
+
 
 def effective_dependencies(task: Task, known_ids: set) -> List[str]:
     """Task IDs that must finish before `task` may start.
@@ -128,6 +131,23 @@ class AI_TEAM_ORCHESTRATOR:
         # Initialize state
         self.state: RunState = RunState()
 
+        # Milestone 9: task_id -> {"event": asyncio.Event, "text": Optional[str]}
+        # for tasks currently paused in REQUIRES_USER_INPUT.
+        self._feedback_requests: Dict[str, Dict[str, Any]] = {}
+
+    def submit_feedback(self, task_id: str, feedback: str) -> bool:
+        """Deliver user feedback to a paused task.
+
+        Called from the WebSocket input channel. Returns False when no task
+        with that ID is currently waiting (stale or wrong ID).
+        """
+        entry = self._feedback_requests.get(task_id)
+        if entry is None:
+            return False
+        entry["text"] = feedback
+        entry["event"].set()
+        return True
+
     async def run(self, goal: str, websocket: WebSocket = None) -> Dict[str, Any]:
         """Execute the full orchestration pipeline and return structured results."""
         # Helper to send events over websocket.
@@ -149,6 +169,64 @@ class AI_TEAM_ORCHESTRATOR:
                 except Exception:
                     # Client disconnected — stop the pipeline rather than keep sending
                     raise WebSocketDisconnect()
+
+        async def pause_for_feedback(task: Task, idx: int, question: str) -> Optional[str]:
+            """Park one task in REQUIRES_USER_INPUT until the user replies.
+
+            Siblings in the same wave keep executing; the WebSocket stays
+            open for both directions. Returns the feedback text, or None on
+            timeout — the caller then fails just this task.
+            """
+            event = asyncio.Event()
+            entry = {"event": event, "text": None}
+            self._feedback_requests[task.task_id] = entry
+
+            task.status = "requires_user_input"
+            if run_model is not None:
+                run_model.status = "requires_user_input"
+                db.commit()
+
+            await send_event("task_requires_input", {
+                "task_id": task.task_id,
+                "task_index": idx,
+                "question": question,
+            })
+            print(f"[PAUSE] Task {task.task_id} awaits user feedback: {question[:80]}")
+
+            timed_out = False
+            try:
+                await asyncio.wait_for(event.wait(), timeout=FEEDBACK_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                timed_out = True
+
+            self._feedback_requests.pop(task.task_id, None)
+            feedback = entry["text"]
+            still_paused = bool(self._feedback_requests)
+
+            if timed_out or feedback is None:
+                await send_event("task_input_timeout", {
+                    "task_id": task.task_id,
+                    "task_index": idx,
+                    "reason": "No user feedback received before the input window closed",
+                })
+                if run_model is not None:
+                    run_model.status = (
+                        "requires_user_input" if still_paused else "running"
+                    )
+                    db.commit()
+                task.status = "failed"
+                return None
+
+            if run_model is not None:
+                run_model.status = "requires_user_input" if still_paused else "running"
+                db.commit()
+            await send_event("task_resumed", {
+                "task_id": task.task_id,
+                "task_index": idx,
+                "feedback": feedback,
+            })
+            print(f"[RESUME] Task {task.task_id} continuing with user feedback")
+            return feedback
 
         db = None
         run_model = None
@@ -258,6 +336,20 @@ class AI_TEAM_ORCHESTRATOR:
                     "description": task.description
                 })
                 print(f"\n[TASK] Executing task {idx}/{self.state.total_tasks}: {_sanitize_for_print(task.description)}")
+
+                # Milestone 9: planner flagged this task as ambiguous or
+                # approval-gated — wait for the user before any worker call.
+                if task.requires_user_input:
+                    feedback = await pause_for_feedback(
+                        task,
+                        idx,
+                        f"Task '{task.description}' needs your approval or "
+                        "extra direction before the worker starts.",
+                    )
+                    if feedback is None:
+                        completed_tasks.append(task)
+                        return
+                    task.context = {**task.context, "user_feedback": feedback}
 
                 # Worker executes task with retry logic for JSON parsing errors
                 worker_result = None
@@ -417,7 +509,22 @@ class AI_TEAM_ORCHESTRATOR:
                         "feedback": review_result.feedback
                     })
                     print(f"[FAIL] Task rejected: {review_result.feedback}")
-                    if review_result.retry_allowed:
+
+                    # Milestone 9: reviewer declined to decide — ask the user.
+                    user_feedback_given = False
+                    if review_result.needs_user_input:
+                        feedback = await pause_for_feedback(
+                            task,
+                            idx,
+                            review_result.feedback
+                            or f"Reviewer needs your input on '{task.description}'.",
+                        )
+                        if feedback is None:
+                            return
+                        task.context = {**task.context, "user_feedback": feedback}
+                        user_feedback_given = True
+
+                    if review_result.retry_allowed or user_feedback_given:
                         print("🔄 Retrying task...")
 
                         try:

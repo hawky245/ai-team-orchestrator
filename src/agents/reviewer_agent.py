@@ -17,6 +17,7 @@ REVIEWER_SCHEMA = {
     "properties": {
         "approved": {"type": "boolean"},
         "feedback": {"type": "string"},
+        "requires_user_input": {"type": "boolean"},
     },
     "required": ["approved", "feedback"],
 }
@@ -39,6 +40,10 @@ RULES:
 - Respond with ONLY the JSON object – no extra text, no markdown, no code fences.
 - approved should be true only if the output fully and correctly addresses the task.
 - feedback should be constructive, pointing out what works and what doesn't.
+- If you cannot decide without human judgement (the task is ambiguous, the
+  output makes a choice only the user can endorse, or approval is required
+  before proceeding), set "requires_user_input": true and put your question
+  in "feedback".
 """
 
     def __init__(self, provider: AbstractLLMProvider) -> None:
@@ -80,6 +85,9 @@ Evaluate the worker output. Is it correct, complete, and properly formatted? Pro
         if not isinstance(suggestions, list):
             suggestions = [str(suggestions)]
         retry_allowed = data.get("retry_allowed", True)
+        needs_user_input = data.get("requires_user_input", False)
+        if not isinstance(needs_user_input, bool):
+            needs_user_input = bool(needs_user_input)
         score = float(data.get("score", 0.0))
 
         if not 0.0 <= score <= 1.0:
@@ -91,5 +99,6 @@ Evaluate the worker output. Is it correct, complete, and properly formatted? Pro
             issues=issues,
             suggestions=suggestions,
             retry_allowed=retry_allowed,
+            needs_user_input=needs_user_input,
             score=score,
         )

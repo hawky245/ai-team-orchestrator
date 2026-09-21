@@ -7,6 +7,7 @@ The default implementation uses NVIDIA NIM via an OpenAI-compatible client.
 from __future__ import annotations
 
 import abc
+import asyncio
 import os
 from typing import Any
 
@@ -140,6 +141,19 @@ class NvidiaNimProvider(AbstractLLMProvider):
     FALLBACK_MAX_RETRIES = 2
     RETRY_BASE_DELAY = 1.0
 
+    async def _create_completion(self, model: str, request_kwargs: dict):
+        """Perform the HTTP call in a worker thread.
+
+        The bundled OpenAI client is synchronous; calling it directly would
+        block the event loop for the whole round-trip, silently serializing
+        "concurrent" workers and delaying WebSocket frames. to_thread keeps
+        the loop free so waves truly overlap.
+        """
+        return await asyncio.to_thread(
+            self.client.chat.completions.create,
+            **{**request_kwargs, "model": model},
+        )
+
     async def _create_with_retries(
         self,
         model: str,
@@ -149,7 +163,7 @@ class NvidiaNimProvider(AbstractLLMProvider):
     ):
         """One chat-completions call, retried on transient errors only."""
         attempt = retry_async(
-            lambda: self.client.chat.completions.create(**{**request_kwargs, "model": model}),
+            lambda: self._create_completion(model, request_kwargs),
             max_retries=max_retries,
             base_delay=self.RETRY_BASE_DELAY,
             is_retryable=_is_transient_error,

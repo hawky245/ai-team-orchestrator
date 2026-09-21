@@ -2,7 +2,7 @@ const ws = new WebSocket('ws://127.0.0.1:8100/ws/execute');
 const t0 = Date.now();
 const types = [];
 const timed = [];
-ws.onopen = () => ws.send(JSON.stringify({ goal: 'Research three independent topics (solar panel efficiency, EV battery chemistry, grid-scale storage) in one short paragraph each, then merge the three paragraphs into one summary.' }));
+ws.onopen = () => ws.send(JSON.stringify({ goal: process.argv[2] || 'Research three independent topics (solar panel efficiency, EV battery chemistry, grid-scale storage) in one short paragraph each, then merge the three paragraphs into one summary.' }));
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
   types.push(msg.type);
@@ -20,6 +20,19 @@ ws.onmessage = (e) => {
   }
   if (msg.type === 'run_completed') {
     console.log('final_output present:', !!(msg.data && msg.data.final_output && msg.data.final_output.length > 0));
+  }
+  if (msg.type === 'task_requires_input') {
+    // Human-in-the-loop: auto-approve after a short beat so the run resumes.
+    console.log(`=== TASK_REQUIRES_INPUT: ${msg.data.task_id} — ${msg.data.question} ===`);
+    setTimeout(() => {
+      ws.send(JSON.stringify({
+        type: 'user_feedback',
+        data: { task_id: msg.data.task_id, feedback: 'APPROVED' }
+      }));
+    }, 1500);
+  }
+  if (msg.type === 'task_resumed') {
+    console.log(`task_resumed: ${msg.data.task_id} after feedback "${msg.data.feedback}"`);
   }
   if (['execution_completed', 'execution_complete', 'execution_failed', 'error'].includes(msg.type)) {
     console.log('terminal event:', msg.type);

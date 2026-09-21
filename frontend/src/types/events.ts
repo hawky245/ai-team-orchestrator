@@ -113,3 +113,30 @@ export interface TaskRetryEvent extends OrchestratorEvent {
     reason: string;
   };
 }
+
+export interface TaskRequiresInputEvent extends OrchestratorEvent {
+  type: 'task_requires_input';
+  data: {
+    task_id: string;
+    task_index: number;
+    question: string;
+  };
+}
+
+export interface TaskResumedEvent extends OrchestratorEvent {
+  type: 'task_resumed';
+  data: {
+    task_id: string;
+    task_index: number;
+    feedback: string;
+  };
+}
+
+export interface TaskInputTimeoutEvent extends OrchestratorEvent {
+  type: 'task_input_timeout';
+  data: {
+    task_id: string;
+    task_index: number;
+    reason: string;
+  };
+}

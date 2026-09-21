@@ -266,8 +266,73 @@ def test_concurrent_run():
     )
 
 
+# ---------------------------------------------------------------------------
+# 4. Provider offload: the sync OpenAI client must NOT block the event loop
+#    (live runs showed wave-1 tasks serializing because create() ran on-loop)
+# ---------------------------------------------------------------------------
+
+def test_provider_offloads_sync_client():
+    import threading
+
+    from src.providers.base_provider import NvidiaNimProvider, ProviderConfig
+
+    class FakeRespContent:
+        def __init__(self, content): self.content = content
+
+    class FakeRespChoice:
+        def __init__(self, content):
+            self.message = FakeRespContent(content)
+            self.finish_reason = "stop"
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeRespChoice(content)]
+            self.usage = None
+
+    class BlockingFakeClient:
+        """Mimics the sync OpenAI client: create() blocks its calling thread."""
+
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+            outer = self
+
+            class Completions:
+                def create(self, **kwargs):
+                    with outer.lock:
+                        outer.active += 1
+                        outer.max_active = max(outer.max_active, outer.active)
+                    time.sleep(0.2)
+                    with outer.lock:
+                        outer.active -= 1
+                    return FakeResp('{"ok": true}')
+
+            self.chat = type("C", (), {"completions": Completions()})()
+
+    p = NvidiaNimProvider(ProviderConfig(model_id="m", temperature=0.0, max_tokens=32))
+    p.api_keys = ["test-key"]  # pin: rotation must not replace our fake client
+    client = BlockingFakeClient()
+    p.client = client
+
+    async def go():
+        t0 = time.monotonic()
+        await asyncio.gather(*(
+            p.generate("sys", f"user {i}", schema={"type": "object"}) for i in range(3)
+        ))
+        return time.monotonic() - t0
+
+    wall = asyncio.run(go())
+    assert client.max_active == 3, (
+        f"sync client serialized: max concurrent create() = {client.max_active}"
+    )
+    assert wall < 0.35, f"3 x 0.2s blocking calls took {wall:.2f}s — event loop blocked"
+    print(f"PASS  provider offloads sync client to threads (3 overlapped, {wall:.2f}s)")
+
+
 if __name__ == "__main__":
     test_wave_planning()
     test_planner_parsing()
     test_concurrent_run()
+    test_provider_offloads_sync_client()
     print("\nAll Milestone 8 tests passed.")

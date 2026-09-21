@@ -32,6 +32,12 @@ interface ExecutionLogEntry {
   data: Record<string, unknown>;
 }
 
+interface PendingInput {
+  taskId: string;
+  taskIndex: number;
+  question: string;
+}
+
 const formatLogEntry = (entry: ExecutionLogEntry) => {
   switch (entry.type) {
     case 'task_started':
@@ -64,6 +70,21 @@ const formatLogEntry = (entry: ExecutionLogEntry) => {
         type: 'retry',
         content: `[RETRY] Task ${entry.data.taskId} -> attempt ${entry.data.attempt}: ${entry.data.reason}`
       };
+    case 'task_requires_input':
+      return {
+        type: 'input_request',
+        content: `[INPUT] Task ${entry.data.taskId} paused, waiting for you: ${entry.data.question}`
+      };
+    case 'task_resumed':
+      return {
+        type: 'success',
+        content: `[RESUME] Task ${entry.data.taskId} continuing with your feedback`
+      };
+    case 'task_input_timeout':
+      return {
+        type: 'error',
+        content: `[TIMEOUT] Task ${entry.data.taskId} failed: ${entry.data.reason}`
+      };
     default:
       return {
         type: 'log',
@@ -91,6 +112,7 @@ const ExecutionLogStream = memo(({ logs, isExecuting }: { logs: ExecutionLogEntr
               formatted.type === 'info' ? 'border-primary bg-primary/10' :
               formatted.type === 'tool' ? 'border-warning bg-warning/10' :
               formatted.type === 'retry' ? 'border-warning bg-warning/10 animate-pulse' :
+              formatted.type === 'input_request' ? 'border-warning bg-warning/15 animate-pulse' :
               'border-muted bg-muted/5'
             }`}>
               <div className="flex items-start gap-2">
@@ -100,6 +122,7 @@ const ExecutionLogStream = memo(({ logs, isExecuting }: { logs: ExecutionLogEntr
                   formatted.type === 'info' ? 'bg-primary' :
                   formatted.type === 'tool' ? 'bg-warning' :
                   formatted.type === 'retry' ? 'bg-warning' :
+                  formatted.type === 'input_request' ? 'bg-warning' :
                   'bg-muted'
                 }`}></div>
                 <div className="text-sm whitespace-pre-wrap font-mono">{formatted.content}</div>
@@ -143,6 +166,82 @@ const FinalResultPanel = memo(({ output, isExecuting }: { output: string | null;
   );
 });
 
+// One paused task: question + free-text field + Approve / Provide Feedback.
+function PendingInputCard({ request, onSubmit }: {
+  request: PendingInput;
+  onSubmit: (taskId: string, feedback: string) => void;
+}) {
+  const [text, setText] = useState('');
+  const [answered, setAnswered] = useState(false);
+
+  const submit = (feedback: string) => {
+    if (answered) return;
+    onSubmit(request.taskId, feedback);
+    setAnswered(true);
+  };
+
+  return (
+    <div className="rounded-lg border border-warning/40 bg-background/70 p-4 space-y-3">
+      <div className="text-sm font-medium">Task {request.taskId}</div>
+      <p className="text-sm text-muted-foreground whitespace-pre-wrap">{request.question}</p>
+      <Textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Add direction for the agent (optional)…"
+        className="min-h-[60px]"
+        disabled={answered}
+      />
+      <div className="flex justify-end gap-3">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={answered}
+          onClick={() => submit('APPROVED')}
+        >
+          {answered ? 'Submitted' : 'Approve'}
+        </Button>
+        <Button
+          variant="default"
+          size="sm"
+          disabled={answered || !text.trim()}
+          onClick={() => submit(text.trim())}
+        >
+          {answered ? 'Submitted' : 'Provide Feedback'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// Rendered whenever at least one task is in REQUIRES_USER_INPUT.
+function UserInputRequestsPanel({ requests, onSubmit }: {
+  requests: PendingInput[];
+  onSubmit: (taskId: string, feedback: string) => void;
+}) {
+  if (requests.length === 0) return null;
+  return (
+    <Card className="border-2 border-warning/60 bg-warning/5">
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-2">
+          <span className="h-2.5 w-2.5 rounded-full bg-warning animate-pulse" />
+          <CardTitle className="text-lg font-semibold">
+            Your Input Needed ({requests.length})
+          </CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm text-muted-foreground">
+          Execution is paused for these tasks — the pipeline resumes automatically
+          once you respond. Everything else keeps running.
+        </p>
+        {requests.map((r) => (
+          <PendingInputCard key={r.taskId} request={r} onSubmit={onSubmit} />
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function App() {
   const [inputValue, setInputValue] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
@@ -150,13 +249,15 @@ export default function App() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [executionLogs, setExecutionLogs] = useState<ExecutionLogEntry[]>([]);
   const [finalOutput, setFinalOutput] = useState<string | null>(null);
+  const [pendingInputs, setPendingInputs] = useState<PendingInput[]>([]);
   const { toast } = useToast();
 
-  const { sendMessage, isConnected } = useWebSocket({
+  const { sendMessage, sendFeedback, isConnected } = useWebSocket({
     onExecutionStart: (goal: string) => {
       setIsExecuting(true);
       setFinalOutput(null);
       setExecutionLogs([]);
+      setPendingInputs([]);
       toast({
         title: "Execution Started",
         description: `Started execution for: "${goal}"`,
@@ -164,6 +265,7 @@ export default function App() {
     },
     onExecutionComplete: (summary: TaskSummary, tasks: TaskDetail[]) => {
       setIsExecuting(false);
+      setPendingInputs([]);
       // Refresh runs list
       fetchRuns();
       toast({
@@ -226,6 +328,35 @@ export default function App() {
           type: 'task_retry',
           data: { taskId, attempt, reason }
         }
+      ]);
+    },
+    onTaskRequiresInput: (taskId: string, taskIndex: number, question: string) => {
+      setPendingInputs(prev =>
+        prev.some(p => p.taskId === taskId)
+          ? prev
+          : [...prev, { taskId, taskIndex, question }]
+      );
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'task_requires_input', data: { taskId, taskIndex, question } }
+      ]);
+      toast({
+        title: 'Your input needed',
+        description: `Task ${taskId} is paused until you respond.`,
+      });
+    },
+    onTaskResumed: (taskId: string, feedback: string) => {
+      setPendingInputs(prev => prev.filter(p => p.taskId !== taskId));
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'task_resumed', data: { taskId, feedback } }
+      ]);
+    },
+    onTaskInputTimeout: (taskId: string, reason: string) => {
+      setPendingInputs(prev => prev.filter(p => p.taskId !== taskId));
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'task_input_timeout', data: { taskId, reason } }
       ]);
     },
     onError: (error: string) => {
@@ -375,6 +506,13 @@ export default function App() {
             <FinalResultPanel output={finalOutput} isExecuting={isExecuting} />
           </div>
         </div>
+
+        {/* Human-in-the-loop prompts while tasks are in REQUIRES_USER_INPUT */}
+        {pendingInputs.length > 0 && (
+          <div className="mt-6">
+            <UserInputRequestsPanel requests={pendingInputs} onSubmit={sendFeedback} />
+          </div>
+        )}
 
         {/* Execution Log Stream (remains unchanged) */}
         <div className="mt-6">

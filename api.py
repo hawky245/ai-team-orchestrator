@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+import asyncio
 import json
 
 # Load environment variables before anything else so OPENROUTER_* settings
@@ -84,9 +85,56 @@ async def websocket_execute(websocket: WebSocket):
             })
             return
 
-        # Run the orchestrator with the websocket for streaming
+        # Run the orchestrator with the websocket for streaming while the
+        # same connection carries inbound user_feedback frames (Milestone 9).
+        # A paused task resumes as soon as its feedback arrives here.
         orchestrator = AI_TEAM_ORCHESTRATOR()
-        result = await orchestrator.run(goal, websocket=websocket)
+        run_task = asyncio.create_task(orchestrator.run(goal, websocket=websocket))
+
+        async def feedback_listener() -> None:
+            while True:
+                inbound = await websocket.receive_text()
+                try:
+                    msg = json.loads(inbound)
+                except json.JSONDecodeError:
+                    await safe_send({
+                        "type": "error",
+                        "data": {"message": "Malformed JSON from client"}
+                    })
+                    continue
+                if msg.get("type") == "user_feedback":
+                    data = msg.get("data") or {}
+                    accepted = orchestrator.submit_feedback(
+                        str(data.get("task_id", "")),
+                        str(data.get("feedback", "")),
+                    )
+                    if not accepted:
+                        await safe_send({
+                            "type": "feedback_rejected",
+                            "data": {
+                                "task_id": data.get("task_id"),
+                                "reason": "No task is currently waiting for input",
+                            },
+                        })
+
+        listen_task = asyncio.create_task(feedback_listener())
+        done, _pending = await asyncio.wait(
+            {run_task, listen_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if listen_task in done:
+            # Client disconnected (or the listener crashed) mid-run:
+            # stop the pipeline instead of orphaning it.
+            listen_exc = listen_task.exception()
+            if not isinstance(listen_exc, WebSocketDisconnect):
+                raise listen_exc if listen_exc else RuntimeError("listener died")
+            run_task.cancel()
+            await listen_task  # re-raises WebSocketDisconnect for the handler
+            return
+
+        # Pipeline finished normally; no more feedback can arrive.
+        listen_task.cancel()
+        result = await run_task
 
         # Send final result
         await safe_send({

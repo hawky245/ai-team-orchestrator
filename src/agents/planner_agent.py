@@ -32,6 +32,7 @@ PLANNER_SCHEMA = {
                         "items": {"type": "string"},
                     },
                     "is_parallel": {"type": "boolean"},
+                    "requires_user_input": {"type": "boolean"},
                     "context": {"type": "object"},
                 },
                 "required": ["task_id", "description"],
@@ -70,6 +71,9 @@ RULES:
   genuinely does not need any other task's output.
 - Add depends_on entries for every task that builds on, polishes, or reviews
   another task's output.
+- If a task is ambiguous, risky, or needs explicit user approval before the
+  worker may start, set "requires_user_input": true on it. The orchestrator
+  will pause that task and ask the user for direction first.
 - Set "execution_order" to "dag" when the plan contains a dependency structure
   (the usual case). Use "sequential" only when EVERY task requires the output
   of the task directly before it.
@@ -137,12 +141,17 @@ RULES:
             if not isinstance(is_parallel, bool):
                 is_parallel = bool(is_parallel)
 
+            requires_user_input = t.get("requires_user_input", False)
+            if not isinstance(requires_user_input, bool):
+                requires_user_input = bool(requires_user_input)
+
             tasks.append(
                 Task(
                     task_id=task_id,
                     description=description,
                     dependencies=raw_deps,
                     is_parallel=is_parallel,
+                    requires_user_input=requires_user_input,
                     context=context,
                 )
             )
