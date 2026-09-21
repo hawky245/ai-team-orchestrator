@@ -1,6 +1,8 @@
 import { RunData } from '../types/api';
 
-const API_BASE_URL = 'http://127.0.0.1:8100';
+// Dev: talk to uvicorn directly on 8100. Production (Docker/nginx): use
+// same-origin /api calls that nginx proxies to the backend service.
+const API_BASE_URL = import.meta.env.DEV ? 'http://127.0.0.1:8100' : '';
 
 export class ApiService {
   static async getRuns(): Promise<RunData[]> {

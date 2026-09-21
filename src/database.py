@@ -5,6 +5,7 @@ Uses SQLite for local persistence of runs and tasks.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import List, Optional
 
@@ -25,7 +26,9 @@ from sqlalchemy.orm import sessionmaker
 # Engine & session factory
 # ---------------------------------------------------------------------------
 
-DB_PATH = "orchestrator.db"
+# DB_PATH lets Docker/compose point the SQLite file at a mounted volume;
+# local runs keep using ./orchestrator.db.
+DB_PATH = os.getenv("DB_PATH", "orchestrator.db")
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(DATABASE_URL, echo=False)

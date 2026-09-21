@@ -5,8 +5,12 @@ import sys
 import io
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+# Only wrap the real process stdout (Windows cp1252 console). Under a test
+# runner that has replaced sys.stdout for capture, re-wrapping its buffer
+# breaks the harness ("I/O operation on closed file").
+if sys.stdout is sys.__stdout__ and hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 
 """

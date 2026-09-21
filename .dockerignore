@@ -1,0 +1,20 @@
+# --- backend image build context excludes -------------------------------
+.git/
+.github/
+venv/
+frontend/
+graphify-out/
+__pycache__/
+*.py[cod]
+*.egg-info/
+orchestrator.db
+data/
+tests/
+test_*.py
+test_ws.*
+inspect_tmp.py
+pw_final.mjs
+*.md
+.env
+.idea/
+.vscode/

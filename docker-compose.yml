@@ -1,0 +1,42 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator-backend
+    # LLM keys etc. (kept out of git)
+    env_file:
+      - .env
+    environment:
+      # SQLite lives on a named volume so run history survives restarts
+      DB_PATH: /app/data/orchestrator.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - sqlite-data:/app/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs')" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: orchestrator-frontend
+    # The static bundle derives its API/WS URLs at runtime (same-origin via
+    # the nginx proxy), so .env here is only for optional build-time extras.
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  sqlite-data:

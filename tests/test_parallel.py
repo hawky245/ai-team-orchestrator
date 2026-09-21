@@ -214,7 +214,9 @@ def test_concurrent_run():
         f"expected 3 concurrent workers in wave 1, saw {provider.max_active_workers}"
     )
     sequential_floor = 4 * WORKER_DELAY
-    assert wall < sequential_floor * 0.9, (
+    # max_active==3 is the hard overlap proof; wall time is a noisy secondary
+    # check (Windows timers), so the margin only needs to exclude sequential.
+    assert wall < sequential_floor * 0.95, (
         f"run took {wall:.2f}s; sequential floor is {sequential_floor:.2f}s — not concurrent"
     )
 

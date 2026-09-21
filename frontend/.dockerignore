@@ -1,0 +1,6 @@
+# node_modules is reinstalled from the lockfile inside the image; the local
+# (Windows) tree must not leak into Linux builds.
+node_modules/
+dist/
+*.local
+.git

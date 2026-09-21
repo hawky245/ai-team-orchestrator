@@ -4,6 +4,14 @@ import { OrchestratorEvent, ExecutionStartedEvent, ExecutionCompletedEvent,
          TaskWorkerCompletedEvent, TaskReviewPassedEvent, TaskReviewFailedEvent }
   from '../types/events';
 
+// Dev: connect to uvicorn directly. Production (Docker/nginx): same-origin
+// /ws/execute, which nginx proxies (with the WS upgrade headers) to backend.
+function orchestratorWsUrl(): string {
+  if (import.meta.env.DEV) return 'ws://127.0.0.1:8100/ws/execute';
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${window.location.host}/ws/execute`;
+}
+
 interface UseWebSocketProps {
   onEvent?: (event: OrchestratorEvent) => void;
   onExecutionStart?: (goal: string) => void;
@@ -74,7 +82,7 @@ export function useWebSocket({
     const connect = () => {
       if (cancelled) return;
 
-      const newWs = new WebSocket('ws://127.0.0.1:8100/ws/execute');
+      const newWs = new WebSocket(orchestratorWsUrl());
 
       newWs.onopen = () => {
         console.log('WebSocket connected');
