@@ -61,6 +61,7 @@ class Task(BaseModel):
     dependencies: List[str] = Field(default_factory=list)
     is_parallel: bool = False
     requires_user_input: bool = False
+    model_override: Optional[str] = None
     context: Dict[str, Any] = Field(default_factory=dict)
     output: Optional[str] = None
     artifacts: List[Artifact] = Field(default_factory=list)

@@ -74,6 +74,7 @@ Rules:
                 tool_registry=TOOL_REGISTRY,
                 on_tool_call=on_tool_call,
                 on_retry=on_retry,
+                model=task.model_override,
             )
         else:
             response: ProviderResponse = await self.provider.generate(
@@ -81,6 +82,7 @@ Rules:
                 user_prompt=prompt,
                 schema=WORKER_SCHEMA,
                 on_retry=on_retry,
+                model=task.model_override,
             )
 
         print("\n=== RAW MODEL RESPONSE ===")

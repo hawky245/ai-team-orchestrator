@@ -112,7 +112,7 @@ def plan_execution_waves(
 class AI_TEAM_ORCHESTRATOR:
     """Main orchestrator for the AI Team MVP."""
 
-    def __init__(self) -> None:
+    def __init__(self, api_key: Optional[str] = None) -> None:
         # Load provider configuration from environment
         # Generic LLM_ variables allow switching providers via .env only
         model_id = os.getenv("LLM_MODEL_ID", "openai/gpt-6-astra")
@@ -124,8 +124,10 @@ class AI_TEAM_ORCHESTRATOR:
             max_tokens=max_tok,
         )
 
-        # Initialize provider
-        self.provider = NvidiaNimProvider(config)
+        # Initialize provider. A user-supplied key (dashboard/API) overrides
+        # the .env keys for every agent, which all share this provider.
+        # NOTE: never log api_key.
+        self.provider = NvidiaNimProvider(config, api_key=api_key)
 
         # Initialize agents
         self.planner = PlannerAgent(self.provider)
@@ -138,6 +140,24 @@ class AI_TEAM_ORCHESTRATOR:
         # Milestone 9: task_id -> {"event": asyncio.Event, "text": Optional[str]}
         # for tasks currently paused in REQUIRES_USER_INPUT.
         self._feedback_requests: Dict[str, Dict[str, Any]] = {}
+
+        # Milestone 13: pending plan-review gate. {"event", "assignments"} where
+        # assignments maps task_id -> chosen model string ("auto"/absent keeps
+        # the planner's routing). Set while run() waits after planning.
+        self._plan_review: Optional[Dict[str, Any]] = None
+
+    def submit_plan_assignments(self, assignments: Dict[str, Any]) -> bool:
+        """Deliver user-chosen per-task models to the paused plan-review gate.
+
+        Called from the WebSocket input channel when run() is waiting after
+        planning. Returns False if no plan review is currently pending.
+        """
+        entry = self._plan_review
+        if entry is None:
+            return False
+        entry["assignments"] = assignments or {}
+        entry["event"].set()
+        return True
 
     def submit_feedback(self, task_id: str, feedback: str) -> bool:
         """Deliver user feedback to a paused task.
@@ -152,7 +172,14 @@ class AI_TEAM_ORCHESTRATOR:
         entry["event"].set()
         return True
 
-    async def run(self, goal: str, websocket: WebSocket = None) -> Dict[str, Any]:
+    async def run(
+        self,
+        goal: str,
+        websocket: WebSocket = None,
+        model_selection: Optional[str] = None,
+        review_plan: bool = False,
+        plan_models: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """Execute the full orchestration pipeline and return structured results."""
         # Helper to send events over websocket.
         # Milestone 8: concurrent workers emit frames from multiple coroutines;
@@ -297,6 +324,110 @@ class AI_TEAM_ORCHESTRATOR:
             task_index_by_id = {
                 t.task_id: i for i, t in enumerate(plan_result.tasks, 1)
             }
+
+            # Dynamic model selection: when the dashboard forces a specific
+            # model, override every task's planner-chosen model_override before
+            # the wave scheduler runs. "Auto"/empty leaves planner routing intact.
+            forced_model = (model_selection or "").strip()
+            if forced_model and forced_model.lower() != "auto":
+                for _t in plan_result.tasks:
+                    _t.model_override = forced_model
+                await send_event("model_selection", {
+                    "model": forced_model,
+                    "task_count": len(plan_result.tasks),
+                })
+                print(
+                    f"[INFO] Model selection: forced all "
+                    f"{len(plan_result.tasks)} tasks onto '{forced_model}'"
+                )
+
+            # Pre-selected per-task models (chosen in the dashboard BEFORE the
+            # run, keyed by task id t1..t7): applied right after planning, so
+            # nothing has to pause mid-run. Beats the run-level forced choice
+            # for the tasks it names; unknown ids are simply ignored.
+            preselected = 0
+            if plan_models:
+                for _t in plan_result.tasks:
+                    chosen = str(plan_models.get(_t.task_id, "")).strip()
+                    if chosen and chosen.lower() != "auto":
+                        _t.model_override = chosen
+                        preselected += 1
+                if preselected:
+                    await send_event("plan_models_applied", {
+                        "assigned": preselected,
+                        "assignments": {
+                            _t.task_id: _t.model_override or "auto"
+                            for _t in plan_result.tasks
+                        },
+                    })
+                    print(
+                        f"[INFO] Pre-selected models applied to {preselected} "
+                        "task slot(s)"
+                    )
+
+            # Plan-review gate (dashboard "assign a model per task"): hold the
+            # (still open) WebSocket after planning so the user can attach a
+            # model to each task before any worker starts. A timeout degrades
+            # to the planner's own routing rather than failing the run.
+            if review_plan:
+                review_event = asyncio.Event()
+                self._plan_review = {"event": review_event, "assignments": None}
+                if run_model is not None:
+                    run_model.status = "requires_user_input"
+                    db.commit()
+                await send_event("plan_review_requested", {
+                    "task_count": len(plan_result.tasks),
+                    "tasks": [
+                        {
+                            "task_id": t.task_id,
+                            "task_index": task_index_by_id[t.task_id],
+                            "description": t.description,
+                            "depends_on": effective_dependencies(t, known_ids),
+                            "planner_model": t.model_override or "auto",
+                            "requires_user_input": t.requires_user_input,
+                        }
+                        for t in plan_result.tasks
+                    ],
+                })
+                print("[PAUSE] Plan review requested; awaiting per-task model assignments")
+
+                review_timed_out = False
+                try:
+                    await asyncio.wait_for(
+                        review_event.wait(), timeout=FEEDBACK_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    review_timed_out = True
+
+                assignments = (self._plan_review or {}).get("assignments") or {}
+                self._plan_review = None
+                if run_model is not None:
+                    run_model.status = "running"
+                    db.commit()
+
+                if review_timed_out:
+                    await send_event("plan_review_timeout", {
+                        "reason": "No assignments received; proceeding with planner routing",
+                    })
+                    print("[TIMEOUT] Plan review window closed; using planner models")
+                else:
+                    assigned = 0
+                    for t in plan_result.tasks:
+                        chosen = str(assignments.get(t.task_id, "")).strip()
+                        if chosen and chosen.lower() != "auto":
+                            t.model_override = chosen
+                            assigned += 1
+                    await send_event("plan_review_completed", {
+                        "assigned": assigned,
+                        "assignments": {
+                            t.task_id: t.model_override or "auto"
+                            for t in plan_result.tasks
+                        },
+                    })
+                    print(
+                        f"[OK] Plan review done: {assigned} task(s) given "
+                        "user-chosen models"
+                    )
 
             waves = plan_execution_waves(
                 plan_result.tasks, plan_result.execution_order

@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
-import { useWebSocket } from '@/services/ws';
+import { useWebSocket, PlanReviewTask } from '@/services/ws';
 import { ApiService } from '@/services/api';
 import { RunData } from '@/types/api';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -84,6 +84,31 @@ const formatLogEntry = (entry: ExecutionLogEntry) => {
       return {
         type: 'error',
         content: `[TIMEOUT] Task ${entry.data.taskId} failed: ${entry.data.reason}`
+      };
+    case 'model_selection':
+      return {
+        type: 'info',
+        content: `[MODEL] All ${entry.data.taskCount} tasks forced onto ${entry.data.model} (user selection)`
+      };
+    case 'plan_review_requested':
+      return {
+        type: 'info',
+        content: `[PLAN] Paused after planning — assign models per task to start execution`
+      };
+    case 'plan_review_completed':
+      return {
+        type: 'success',
+        content: `[PLAN] Assignments applied (${entry.data.assigned} task(s) got a custom model); execution started`
+      };
+    case 'plan_review_timeout':
+      return {
+        type: 'error',
+        content: `[PLAN] Review window closed: ${entry.data.reason}`
+      };
+    case 'plan_models_applied':
+      return {
+        type: 'success',
+        content: `[PLAN] Pre-assigned models applied to ${entry.data.assigned} task slot(s)`
       };
     default:
       return {
@@ -242,6 +267,89 @@ function UserInputRequestsPanel({ requests, onSubmit }: {
   );
 }
 
+// Shown between planning and execution when "assign per task" is checked:
+// one row per planned task, each with its own model dropdown.
+function PlanReviewPanel({ tasks, models, assignments, sent, onAssign, onStart }: {
+  tasks: PlanReviewTask[];
+  models: string[];
+  assignments: Record<string, string>;
+  sent: boolean;
+  onAssign: (taskId: string, model: string) => void;
+  onStart: () => void;
+}) {
+  return (
+    <Card className="border-2 border-primary/50 bg-primary/5">
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-2">
+          <span className="h-2.5 w-2.5 rounded-full bg-primary animate-pulse" />
+          <CardTitle className="text-lg font-semibold">Review Plan — Pick a Model per Task</CardTitle>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Execution is paused. Each row shows what the task will do, what it
+          waits for, and the model the Planner proposed. Override any of them,
+          then start — tasks still run concurrently wherever their dependencies allow.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {tasks.map((t) => {
+          const fallbackLabel = t.planner_model === 'auto' ? 'planner default' : t.planner_model;
+          return (
+            <div
+              key={t.task_id}
+              className="rounded-lg border border-border bg-background/70 p-3 flex flex-col md:flex-row md:items-center gap-3"
+            >
+              <div className="font-mono text-xs text-muted-foreground w-8 shrink-0">{t.task_id}</div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm">{t.description}</div>
+                <div className="text-[11px] text-muted-foreground">
+                  {t.depends_on.length > 0
+                    ? `waits for ${t.depends_on.join(', ')}`
+                    : 'starts immediately (no dependencies)'}
+                  {t.planner_model !== 'auto' && ` · planner picked ${t.planner_model}`}
+                  {t.requires_user_input && ' · asks your approval before starting'}
+                </div>
+              </div>
+              <select
+                aria-label={`Model for ${t.task_id}`}
+                value={assignments[t.task_id] ?? 'auto'}
+                onChange={(e) => onAssign(t.task_id, e.target.value)}
+                disabled={sent}
+                className="h-9 w-full md:w-72 shrink-0 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
+              >
+                <option value="auto">Auto ({fallbackLabel})</option>
+                {models.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </div>
+          );
+        })}
+        <div className="flex justify-end pt-1">
+          <Button onClick={onStart} disabled={sent} className="px-5">
+            {sent ? 'Starting…' : 'Start Execution'}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Pre-run per-slot model choices (Planner always ids tasks t1..t7).
+const SLOT_IDS = ['t1', 't2', 't3', 't4', 't5', 't6', 't7'];
+const SLOT_STORAGE_KEY = 'orchestrator_slot_models';
+
+function loadSlotModels(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SLOT_STORAGE_KEY) ?? '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, string>;
+    }
+  } catch {
+    /* corrupted storage -> start clean */
+  }
+  return {};
+}
+
 export default function App() {
   const [inputValue, setInputValue] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
@@ -250,14 +358,85 @@ export default function App() {
   const [executionLogs, setExecutionLogs] = useState<ExecutionLogEntry[]>([]);
   const [finalOutput, setFinalOutput] = useState<string | null>(null);
   const [pendingInputs, setPendingInputs] = useState<PendingInput[]>([]);
+  // Per-run provider key. Kept out of React's rendered text (masked input);
+  // persisted so a page reload doesn't force re-entering it.
+  const [apiKey, setApiKey] = useState<string>(
+    () => localStorage.getItem('orchestrator_api_key') ?? ''
+  );
+  const [models, setModels] = useState<string[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>('auto');
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [reviewPlan, setReviewPlan] = useState<boolean>(
+    () => localStorage.getItem('orchestrator_review_plan') === '1'
+  );
+  const [planReviewTasks, setPlanReviewTasks] = useState<PlanReviewTask[] | null>(null);
+  const [planAssignments, setPlanAssignments] = useState<Record<string, string>>({});
+  const [planReviewSent, setPlanReviewSent] = useState(false);
+  const [slotModels, setSlotModels] = useState<Record<string, string>>(loadSlotModels);
   const { toast } = useToast();
 
-  const { sendMessage, sendFeedback, isConnected } = useWebSocket({
+  const handleSlotModelChange = (slot: string, model: string) => {
+    setSlotModels(prev => {
+      const next = { ...prev, [slot]: model };
+      localStorage.setItem(SLOT_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const handleClearSlots = () => {
+    setSlotModels({});
+    localStorage.removeItem(SLOT_STORAGE_KEY);
+  };
+
+  const fetchModels = useCallback(async (opts?: { silent?: boolean }) => {
+    setLoadingModels(true);
+    try {
+      const list = await ApiService.getModels(apiKey.trim() || undefined);
+      setModels(list);
+      if (!opts?.silent) {
+        toast({
+          title: 'Models loaded',
+          description: `${list.length} models available${apiKey.trim() ? ' for your key' : ' on the server key'}.`,
+        });
+      }
+    } catch (error: unknown) {
+      setModels([]);
+      if (!opts?.silent) {
+        toast({
+          title: 'Model fetch failed',
+          description: error instanceof Error ? error.message : 'Could not list models',
+          variant: 'destructive',
+        });
+      }
+    } finally {
+      setLoadingModels(false);
+    }
+  }, [apiKey, toast]);
+
+  // Populate the picker with the server-key catalogue on first load; the
+  // "Fetch Models" button re-queries with a custom key afterwards.
+  useEffect(() => {
+    fetchModels({ silent: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleApiKeyChange = (value: string) => {
+    setApiKey(value);
+    if (value) {
+      localStorage.setItem('orchestrator_api_key', value);
+    } else {
+      localStorage.removeItem('orchestrator_api_key');
+    }
+  };
+
+  const { sendMessage, sendFeedback, sendPlanAssignments, isConnected } = useWebSocket({
     onExecutionStart: (goal: string) => {
       setIsExecuting(true);
       setFinalOutput(null);
       setExecutionLogs([]);
       setPendingInputs([]);
+      setPlanReviewTasks(null);
+      setPlanReviewSent(false);
       toast({
         title: "Execution Started",
         description: `Started execution for: "${goal}"`,
@@ -359,6 +538,55 @@ export default function App() {
         { type: 'task_input_timeout', data: { taskId, reason } }
       ]);
     },
+    onModelSelection: (model: string, taskCount: number) => {
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'model_selection', data: { model, taskCount } }
+      ]);
+    },
+    onPlanReviewRequest: (tasks: PlanReviewTask[]) => {
+      setPlanReviewTasks(tasks);
+      setPlanReviewSent(false);
+      // Pre-fill rows with any pre-assigned slot models, else the Planner's pick
+      setPlanAssignments(
+        Object.fromEntries(tasks.map(t => [
+          t.task_id,
+          slotModels[t.task_id] && slotModels[t.task_id] !== 'auto'
+            ? slotModels[t.task_id]
+            : 'auto'
+        ]))
+      );
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'plan_review_requested', data: { taskCount: tasks.length } }
+      ]);
+      toast({
+        title: 'Plan ready for review',
+        description: 'Pick a model per task, then start execution.',
+      });
+    },
+    onPlanReviewCompleted: (assigned: number) => {
+      setPlanReviewTasks(null);
+      setPlanReviewSent(false);
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'plan_review_completed', data: { assigned } }
+      ]);
+    },
+    onPlanReviewTimeout: (reason: string) => {
+      setPlanReviewTasks(null);
+      setPlanReviewSent(false);
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'plan_review_timeout', data: { reason } }
+      ]);
+    },
+    onPlanModelsApplied: (assigned: number) => {
+      setExecutionLogs(prev => [
+        ...prev,
+        { type: 'plan_models_applied', data: { assigned } }
+      ]);
+    },
     onError: (error: string) => {
       setIsExecuting(false);
       toast({
@@ -427,10 +655,38 @@ export default function App() {
 
   const handleWebSocketSubmit = () => {
     if (!inputValue.trim() || !isConnected || isExecuting) return;
-    sendMessage(inputValue);
+    const preselected = Object.fromEntries(
+      Object.entries(slotModels).filter(([, m]) => m && m !== 'auto')
+    );
+    sendMessage(
+      inputValue,
+      apiKey.trim() || undefined,
+      selectedModel !== 'auto' ? selectedModel : undefined,
+      reviewPlan || undefined,
+      Object.keys(preselected).length > 0 ? preselected : undefined
+    );
     setIsExecuting(true);
     setExecutionLogs([]);
     setInputValue('');
+  };
+
+  const handleReviewPlanToggle = (checked: boolean) => {
+    setReviewPlan(checked);
+    if (checked) {
+      localStorage.setItem('orchestrator_review_plan', '1');
+    } else {
+      localStorage.removeItem('orchestrator_review_plan');
+    }
+  };
+
+  const handlePlanAssign = (taskId: string, model: string) => {
+    setPlanAssignments(prev => ({ ...prev, [taskId]: model }));
+  };
+
+  const handleStartPlanExecution = () => {
+    if (!planReviewTasks || planReviewSent) return;
+    setPlanReviewSent(true);
+    sendPlanAssignments(planAssignments);
   };
 
   return (
@@ -478,6 +734,112 @@ export default function App() {
                       disabled={isExecuting}
                     />
                   </div>
+                  <div className="space-y-1">
+                    <label
+                      htmlFor="provider-api-key"
+                      className="text-xs font-medium text-muted-foreground"
+                    >
+                      Custom OpenAI/Provider API Key (optional — overrides the server's .env key for this run)
+                    </label>
+                    <Input
+                      id="provider-api-key"
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={apiKey}
+                      onChange={(e) => handleApiKeyChange(e.target.value)}
+                      placeholder="sk-... (comma-separated keys rotate per request)"
+                      disabled={isExecuting}
+                    />
+                    {apiKey && (
+                      <p className="text-[11px] text-muted-foreground">
+                        Stored in this browser's localStorage; sent only with runs you start.
+                      </p>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    <label htmlFor="model-select" className="text-xs font-medium text-muted-foreground">
+                      Execution model
+                    </label>
+                    <div className="flex gap-2">
+                      <select
+                        id="model-select"
+                        value={selectedModel}
+                        onChange={(e) => setSelectedModel(e.target.value)}
+                        disabled={isExecuting}
+                        className="flex h-9 w-full items-center rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
+                      >
+                        <option value="auto">Auto (Planner Decides)</option>
+                        {models.map((m) => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
+                      </select>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => fetchModels()}
+                        disabled={loadingModels || isExecuting}
+                        className="shrink-0 px-3"
+                      >
+                        <RefreshCw className={`h-4 w-4 mr-1 ${loadingModels ? 'animate-spin' : ''}`} />
+                        {loadingModels ? 'Fetching…' : 'Fetch Models'}
+                      </Button>
+                    </div>
+                    {models.length === 0 && !loadingModels && (
+                      <p className="text-[11px] text-muted-foreground">
+                        Model list is empty — press Fetch Models (add a custom key above first if needed).
+                      </p>
+                    )}
+                    <label className="flex items-center gap-2 pt-1 text-xs text-muted-foreground cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={reviewPlan}
+                        onChange={(e) => handleReviewPlanToggle(e.target.checked)}
+                        className="h-3.5 w-3.5 accent-primary"
+                      />
+                      Review the plan first — assign a model per task (pauses after planning)
+                    </label>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-medium text-muted-foreground">
+                        Pre-assign models to task slots (applied right after planning — no pause)
+                      </label>
+                      {Object.values(slotModels).some(m => m && m !== 'auto') && (
+                        <button
+                          type="button"
+                          onClick={handleClearSlots}
+                          className="text-[11px] text-muted-foreground underline hover:text-foreground"
+                        >
+                          Clear all
+                        </button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {SLOT_IDS.map(slot => (
+                        <div key={slot} className="flex items-center gap-2">
+                          <span className="font-mono text-xs text-muted-foreground w-6 shrink-0">{slot}</span>
+                          <select
+                            aria-label={`Pre-assigned model for ${slot}`}
+                            value={slotModels[slot] ?? 'auto'}
+                            onChange={(e) => handleSlotModelChange(slot, e.target.value)}
+                            disabled={isExecuting}
+                            className="h-8 flex-1 min-w-0 rounded-md border border-input bg-background px-2 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
+                          >
+                            <option value="auto">Auto</option>
+                            {models.map((m) => (
+                              <option key={m} value={m}>{m}</option>
+                            ))}
+                          </select>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                      The Planner numbers tasks t1…t7 in plan order, so slots it doesn’t
+                      reach are ignored. Saved in this browser for future runs.
+                    </p>
+                  </div>
                   <div className="flex justify-end space-x-3">
                     <Button
                       variant="outline"
@@ -511,6 +873,20 @@ export default function App() {
         {pendingInputs.length > 0 && (
           <div className="mt-6">
             <UserInputRequestsPanel requests={pendingInputs} onSubmit={sendFeedback} />
+          </div>
+        )}
+
+        {/* Plan-review gate: per-task model assignment between planning and execution */}
+        {planReviewTasks && (
+          <div className="mt-6">
+            <PlanReviewPanel
+              tasks={planReviewTasks}
+              models={models}
+              assignments={planAssignments}
+              sent={planReviewSent}
+              onAssign={handlePlanAssign}
+              onStart={handleStartPlanExecution}
+            />
           </div>
         )}
 

@@ -52,4 +52,28 @@ export class ApiService {
       throw error;
     }
   }
+
+  // Fetch the provider's available models for the picker. Optionally scoped
+  // to a custom API key; throws with the server's message on auth failure.
+  static async getModels(apiKey?: string): Promise<string[]> {
+    const params = new URLSearchParams();
+    if (apiKey && apiKey.trim()) params.set('api_key', apiKey.trim());
+    const qs = params.toString();
+    const response = await fetch(
+      `${API_BASE_URL}/api/models${qs ? `?${qs}` : ''}`,
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    if (!response.ok) {
+      let detail = `HTTP error! status: ${response.status}`;
+      try {
+        const body = await response.json();
+        if (body && body.detail) detail = String(body.detail);
+      } catch {
+        /* non-JSON error body — keep the status message */
+      }
+      throw new Error(detail);
+    }
+    const data = await response.json();
+    return Array.isArray(data.models) ? data.models : [];
+  }
 }

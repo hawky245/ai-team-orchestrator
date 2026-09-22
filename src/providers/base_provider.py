@@ -107,14 +107,19 @@ class NvidiaNimProvider(AbstractLLMProvider):
     Supports rotating through multiple API keys (comma‑separated in ``LLM_API_KEY``)
     for load‑balancing or fallback when a key hits rate limits. The first key is used
     by default; subsequent calls rotate round‑robin.
+
+    An ``api_key`` passed to the constructor (e.g. supplied by a user through the
+    dashboard) replaces the environment keys entirely; commas still split it into
+    a rotation set.
     """
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, api_key: str | None = None) -> None:
         self.config = config
 
         # Provider-agnostic env vars: any .env setting these will work
         # across OpenAI, Gemini, OpenRouter, or local OpenAI-compatible hosts.
-        raw_key = os.getenv("LLM_API_KEY", "")
+        # A caller-provided key (dynamic user key) wins over the environment.
+        raw_key = api_key.strip() if api_key and api_key.strip() else os.getenv("LLM_API_KEY", "")
         # Allow multiple keys separated by commas for multi‑provider support.
         self.api_keys = [k.strip() for k in raw_key.split(",") if k.strip()]
         if not self.api_keys:
@@ -136,6 +141,36 @@ class NvidiaNimProvider(AbstractLLMProvider):
             return self.api_keys[0]
         self._key_index = (self._key_index + 1) % len(self.api_keys)
         return self.api_keys[self._key_index]
+
+    async def list_models(self) -> list[str]:
+        """Return sorted model IDs visible to this provider's credentials.
+
+        Used by the /api/models proxy so the dashboard can offer a model
+        picker without hardcoding model names. Auth failures surface as a
+        clean ProviderError — the message never echoes the key itself.
+        """
+        try:
+            response = await asyncio.to_thread(self.client.models.list)
+        except openai.AuthenticationError as e:
+            raise ProviderError(
+                "The provider rejected this API key (401). "
+                "Check the key and try again."
+            ) from e
+        except openai.PermissionDeniedError as e:
+            raise ProviderError(
+                "This API key is not allowed to list models (403)."
+            ) from e
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(f"Model listing failed: {type(e).__name__}: {e}")
+
+        ids = {
+            m.id
+            for m in (getattr(response, "data", None) or [])
+            if getattr(m, "id", None)
+        }
+        return sorted(ids)
 
     TRANSIENT_MAX_RETRIES = 3
     FALLBACK_MAX_RETRIES = 2
@@ -171,8 +206,16 @@ class NvidiaNimProvider(AbstractLLMProvider):
         )
         return await attempt()
 
-    async def _create_with_backoff(self, request_kwargs: dict, on_retry=None):
+    async def _create_with_backoff(
+        self,
+        request_kwargs: dict,
+        on_retry=None,
+        model: str | None = None,
+    ):
         """Create a completion with resilience layered on top of the raw call.
+
+        `model` (a task-level model_override) takes precedence over the
+        configured primary model; the env fallback still applies to it.
 
         1. Primary model: up to TRANSIENT_MAX_RETRIES tries with exponential
            backoff + jitter on 503/429/timeout-class failures.
@@ -182,7 +225,7 @@ class NvidiaNimProvider(AbstractLLMProvider):
            structured fallback state instead of an opaque crash.
         Non-transient errors (400/401/404...) propagate on the first try.
         """
-        primary = self.config.model_id
+        primary = model or self.config.model_id
         attempts = self.TRANSIENT_MAX_RETRIES
         try:
             return await self._create_with_retries(primary, request_kwargs, on_retry, attempts)
@@ -233,6 +276,8 @@ class NvidiaNimProvider(AbstractLLMProvider):
 
         temp = kwargs.get("temperature", self.config.temperature)
         on_retry = kwargs.get("on_retry")
+        # Task-level model routing: an explicit `model` beats the global config.
+        model = kwargs.get("model") or self.config.model_id
         # Ensure max_tokens is at least 8192 to prevent truncation
         configured_max_tok = kwargs.get("max_tokens", self.config.max_tokens)
         max_tok = max(configured_max_tok, 8192)
@@ -242,7 +287,7 @@ class NvidiaNimProvider(AbstractLLMProvider):
         response_format = {"type": "json_object"} if schema else None
 
         request_kwargs = {
-            "model": self.config.model_id,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -256,7 +301,7 @@ class NvidiaNimProvider(AbstractLLMProvider):
             request_kwargs["response_format"] = response_format
 
         try:
-            response = await self._create_with_backoff(request_kwargs, on_retry)
+            response = await self._create_with_backoff(request_kwargs, on_retry, model=model)
 
             # Safely extract the first choice, handling None/empty responses
             if not response.choices:
@@ -318,6 +363,7 @@ class NvidiaNimProvider(AbstractLLMProvider):
         tool_registry: dict,
         on_tool_call=None,
         on_retry=None,
+        model: str | None = None,
     ) -> ProviderResponse:
         """Run an OpenAI-compatible tool-calling loop.
 
@@ -332,6 +378,7 @@ class NvidiaNimProvider(AbstractLLMProvider):
         """
         import json as _json
 
+        effective_model = model or self.config.model_id
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -341,7 +388,7 @@ class NvidiaNimProvider(AbstractLLMProvider):
 
         for round_no in range(self.MAX_TOOL_ROUNDS + 1):
             request_kwargs = {
-                "model": self.config.model_id,
+                "model": effective_model,
                 "messages": messages,
                 "temperature": self.config.temperature,
                 "max_tokens": max(self.config.max_tokens, 8192),
@@ -354,7 +401,9 @@ class NvidiaNimProvider(AbstractLLMProvider):
                 request_kwargs.pop("tool_choice")
 
             try:
-                response = await self._create_with_backoff(request_kwargs, on_retry)
+                response = await self._create_with_backoff(
+                    request_kwargs, on_retry, model=effective_model
+                )
             except ProviderError:
                 # Keep ModelExhaustedError's structured fallback state intact.
                 raise

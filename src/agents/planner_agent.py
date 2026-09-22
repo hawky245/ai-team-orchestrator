@@ -33,6 +33,7 @@ PLANNER_SCHEMA = {
                     },
                     "is_parallel": {"type": "boolean"},
                     "requires_user_input": {"type": "boolean"},
+                    "model_override": {"type": "string"},
                     "context": {"type": "object"},
                 },
                 "required": ["task_id", "description"],
@@ -74,6 +75,9 @@ RULES:
 - If a task is ambiguous, risky, or needs explicit user approval before the
   worker may start, set "requires_user_input": true on it. The orchestrator
   will pause that task and ask the user for direction first.
+- Optionally set "model_override": "<provider/model-id>" on a task to run its
+  worker and reviewer on that model instead of the default. Use it only when
+  the goal explicitly names a model for some part of the work.
 - Set "execution_order" to "dag" when the plan contains a dependency structure
   (the usual case). Use "sequential" only when EVERY task requires the output
   of the task directly before it.
@@ -145,6 +149,10 @@ RULES:
             if not isinstance(requires_user_input, bool):
                 requires_user_input = bool(requires_user_input)
 
+            model_override = t.get("model_override")
+            if not isinstance(model_override, str) or not model_override.strip():
+                model_override = None
+
             tasks.append(
                 Task(
                     task_id=task_id,
@@ -152,6 +160,7 @@ RULES:
                     dependencies=raw_deps,
                     is_parallel=is_parallel,
                     requires_user_input=requires_user_input,
+                    model_override=model_override,
                     context=context,
                 )
             )

@@ -67,6 +67,7 @@ Evaluate the worker output. Is it correct, complete, and properly formatted? Pro
             system_prompt=self.SYSTEM_PROMPT,
             user_prompt=prompt,
             schema=REVIEWER_SCHEMA,
+            model=task.model_override,
         )
 
         review = self._parse_result(response.content)

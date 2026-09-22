@@ -5,9 +5,8 @@ from sqlalchemy.orm import Session
 
 import asyncio
 import json
+import os
 
-# Load environment variables before anything else so OPENROUTER_* settings
-# are available when the LLM client and orchestrator are initialized.
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,6 +14,11 @@ load_dotenv()
 import main
 from main import AI_TEAM_ORCHESTRATOR
 from src.database import RunModel, TaskModel, get_db
+from src.providers.base_provider import (
+    NvidiaNimProvider,
+    ProviderConfig,
+    ProviderError,
+)
 
 app = FastAPI()
 
@@ -61,6 +65,30 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
         "tasks": [task.to_dict() for task in tasks]
     }
 
+@app.get("/api/models")
+async def list_available_models(api_key: str | None = None):
+    """Proxy the provider's model catalogue for the dashboard's model picker.
+
+    With `api_key` the list reflects that key's access; without it the
+    server's .env key is used. Invalid keys return a clean 400 — the key
+    itself is never echoed back. (Caveat: query-string keys can land in
+    access logs; the dashboard also accepts keys via the run payload.)
+    """
+    config = ProviderConfig(
+        model_id=os.getenv("LLM_MODEL_ID", "unused-for-listing"),
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
+        max_tokens=int(os.getenv("LLM_MAX_TOKENS", "8192")),
+    )
+    try:
+        provider = NvidiaNimProvider(config, api_key=api_key)
+        models = await provider.list_models()
+    except ProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "models": models,
+        "source": "custom_key" if api_key else "server_env",
+    }
+
 @app.websocket("/ws/execute")
 async def websocket_execute(websocket: WebSocket):
     await websocket.accept()
@@ -81,6 +109,25 @@ async def websocket_execute(websocket: WebSocket):
         data = await websocket.receive_text()
         request_data = json.loads(data)
         goal = request_data.get("goal")
+        # Dynamic user-provided key: initial payload wins, query string is the
+        # fallback. Never log either.
+        api_key = request_data.get("api_key") or websocket.query_params.get("api_key")
+        # Dashboard model picker; "Auto" (or absent) leaves planner routing alone
+        model_selection = request_data.get("model_selection")
+        # Plan-review gate: pause after planning so each task's model can be
+        # assigned from the dashboard before workers start.
+        review_plan = bool(request_data.get("review_plan"))
+        # Pre-selected per-task models (task_id -> model), applied after
+        # planning without pausing. Malformed payloads degrade to "none".
+        raw_plan_models = request_data.get("plan_models")
+        plan_models = (
+            {
+                str(k): str(v)
+                for k, v in raw_plan_models.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+            if isinstance(raw_plan_models, dict) else None
+        )
 
         if not goal:
             await safe_send({
@@ -92,8 +139,16 @@ async def websocket_execute(websocket: WebSocket):
         # Run the orchestrator with the websocket for streaming while the
         # same connection carries inbound user_feedback frames (Milestone 9).
         # A paused task resumes as soon as its feedback arrives here.
-        orchestrator = AI_TEAM_ORCHESTRATOR()
-        run_task = asyncio.create_task(orchestrator.run(goal, websocket=websocket))
+        orchestrator = AI_TEAM_ORCHESTRATOR(api_key=api_key)
+        run_task = asyncio.create_task(
+            orchestrator.run(
+                goal,
+                websocket=websocket,
+                model_selection=model_selection,
+                review_plan=review_plan,
+                plan_models=plan_models,
+            )
+        )
 
         async def feedback_listener() -> None:
             while True:
@@ -107,17 +162,30 @@ async def websocket_execute(websocket: WebSocket):
                     })
                     continue
                 if msg.get("type") == "user_feedback":
-                    data = msg.get("data") or {}
+                    fb_data = msg.get("data") or {}
                     accepted = orchestrator.submit_feedback(
-                        str(data.get("task_id", "")),
-                        str(data.get("feedback", "")),
+                        str(fb_data.get("task_id", "")),
+                        str(fb_data.get("feedback", "")),
                     )
                     if not accepted:
                         await safe_send({
                             "type": "feedback_rejected",
                             "data": {
-                                "task_id": data.get("task_id"),
+                                "task_id": fb_data.get("task_id"),
                                 "reason": "No task is currently waiting for input",
+                            },
+                        })
+                elif msg.get("type") == "plan_model_assignment":
+                    pa_data = msg.get("data") or {}
+                    assignments = pa_data.get("assignments")
+                    if not isinstance(assignments, dict):
+                        assignments = {}
+                    accepted = orchestrator.submit_plan_assignments(assignments)
+                    if not accepted:
+                        await safe_send({
+                            "type": "feedback_rejected",
+                            "data": {
+                                "reason": "No plan review is currently pending",
                             },
                         })
 

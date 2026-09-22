@@ -12,6 +12,16 @@ function orchestratorWsUrl(): string {
   return `${proto}//${window.location.host}/ws/execute`;
 }
 
+// One planned task as shown in the pre-execution plan-review panel.
+export interface PlanReviewTask {
+  task_id: string;
+  task_index: number;
+  description: string;
+  depends_on: string[];
+  planner_model: string;
+  requires_user_input: boolean;
+}
+
 interface UseWebSocketProps {
   onEvent?: (event: OrchestratorEvent) => void;
   onExecutionStart?: (goal: string) => void;
@@ -28,6 +38,11 @@ interface UseWebSocketProps {
   onTaskRequiresInput?: (taskId: string, taskIndex: number, question: string) => void;
   onTaskResumed?: (taskId: string, feedback: string) => void;
   onTaskInputTimeout?: (taskId: string, reason: string) => void;
+  onModelSelection?: (model: string, taskCount: number) => void;
+  onPlanReviewRequest?: (tasks: PlanReviewTask[]) => void;
+  onPlanReviewCompleted?: (assigned: number) => void;
+  onPlanReviewTimeout?: (reason: string) => void;
+  onPlanModelsApplied?: (assigned: number) => void;
   onError?: (error: string) => void;
   onConnectionChange?: (isConnected: boolean) => void;
 }
@@ -48,6 +63,11 @@ export function useWebSocket({
   onTaskRequiresInput,
   onTaskResumed,
   onTaskInputTimeout,
+  onModelSelection,
+  onPlanReviewRequest,
+  onPlanReviewCompleted,
+  onPlanReviewTimeout,
+  onPlanModelsApplied,
   onError,
   onConnectionChange
 }: UseWebSocketProps = {}) {
@@ -73,6 +93,9 @@ export function useWebSocket({
     onPlanningComplete, onTaskStart, onTaskWorkerComplete, onTaskReviewPassed,
     onTaskReviewFailed, onToolExecute, onTaskRetry,
     onTaskRequiresInput, onTaskResumed, onTaskInputTimeout,
+    onModelSelection,
+    onPlanReviewRequest, onPlanReviewCompleted, onPlanReviewTimeout,
+    onPlanModelsApplied,
     onError, onConnectionChange
   };
 
@@ -155,6 +178,21 @@ export function useWebSocket({
             case 'task_input_timeout':
               propsRef.current.onTaskInputTimeout?.(data.data.task_id, data.data.reason);
               break;
+            case 'model_selection':
+              propsRef.current.onModelSelection?.(data.data.model, data.data.task_count);
+              break;
+            case 'plan_review_requested':
+              propsRef.current.onPlanReviewRequest?.(data.data.tasks);
+              break;
+            case 'plan_review_completed':
+              propsRef.current.onPlanReviewCompleted?.(data.data.assigned);
+              break;
+            case 'plan_review_timeout':
+              propsRef.current.onPlanReviewTimeout?.(data.data.reason);
+              break;
+            case 'plan_models_applied':
+              propsRef.current.onPlanModelsApplied?.(data.data.assigned);
+              break;
             case 'error':
               propsRef.current.onError?.(data.data.message);
               break;
@@ -209,10 +247,38 @@ export function useWebSocket({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const sendMessage = (goal: string) => {
+  const sendMessage = (
+    goal: string,
+    apiKey?: string,
+    modelSelection?: string,
+    reviewPlan?: boolean,
+    planModels?: Record<string, string>
+  ) => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ goal }));
+      const payload: Record<string, unknown> = { goal };
+      // Dynamic per-run provider key; omitted => server falls back to .env.
+      if (apiKey && apiKey.trim()) payload.api_key = apiKey.trim();
+      // Model picker; omitted for "Auto" so the planner decides.
+      if (modelSelection && modelSelection !== 'auto') payload.model_selection = modelSelection;
+      // Plan-review gate: pause after planning for per-task model assignment.
+      if (reviewPlan) payload.review_plan = true;
+      // Pre-selected per-slot models; applied after planning without pausing.
+      if (planModels && Object.keys(planModels).length > 0) payload.plan_models = planModels;
+      ws.send(JSON.stringify(payload));
+    } else {
+      onError?.('WebSocket is not connected');
+    }
+  };
+
+  // Reply to the plan-review gate: {task_id -> model | "auto"}.
+  const sendPlanAssignments = (assignments: Record<string, string>) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'plan_model_assignment',
+        data: { assignments }
+      }));
     } else {
       onError?.('WebSocket is not connected');
     }
@@ -234,6 +300,7 @@ export function useWebSocket({
   return {
     sendMessage,
     sendFeedback,
+    sendPlanAssignments,
     isConnected,
     reconnectAttempts: reconnectAttemptsRef.current
   };
