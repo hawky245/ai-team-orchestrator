@@ -20,7 +20,7 @@ steer mid-run, assign a different model to any step, or hit STOP.
 ## What makes it different
 
 Most "agent" demos are one chat loop with extra steps. This is an **operations
-console for a small AI team** — built milestone by milestone (M1–M21), each one
+console for a small AI team** — built milestone by milestone (M1–M24), each one
 verified by executed evidence, not vibes.
 
 ### Multi-model by design
@@ -115,7 +115,7 @@ never in URLs, never logged, never echoed back.
 
 ## Tests & CI
 
-51 offline tests — wave scheduling, concurrency (with real event-loop timing
+60 offline tests — wave scheduling, concurrency (with real event-loop timing
 checks), tool loops, retry/fallback, pause/resume, plan review, multi-key
 routing, whitelist/guardrail/rotation, file sandboxing, stop semantics. No API
 keys or network needed; GitHub Actions runs them on every push against the same
@@ -124,14 +124,6 @@ Python the Docker image uses.
 ```bash
 PYTHONPATH=. pytest tests/ -q
 ```
-
-## Milestone arc
-
-M1–5 foundations & dashboard · M6 tool calling · M7 retry/fallback · M8
-concurrent DAG waves · M9 human-in-the-loop · M10 Docker + CI · M11–13 dynamic
-keys, model picker, plan review · M14 JARVIS console · M15–16 multi-key bay,
-whitelist, guardrails · M17 model rotation · M20 real file artifacts · M21 STOP
-+ informed pauses · plus a ~950-line simplification audit along the way.
 
 ---
 
