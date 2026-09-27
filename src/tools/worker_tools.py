@@ -59,16 +59,65 @@ READ_FILE_TOOL: Dict[str, Any] = {
     },
 }
 
-WORKER_TOOLS: List[Dict[str, Any]] = [WEB_SEARCH_TOOL, READ_FILE_TOOL]
+WRITE_FILE_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": (
+            "Write (create or overwrite) a text file inside the project workspace. "
+            "Paths are sandboxed to the project root; secrets and outside paths are "
+            "rejected. Returns the stored path on success — only claim a file was "
+            "saved after this tool reports status ok."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filepath": {
+                    "type": "string",
+                    "description": "Target path, relative to the workspace root.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The full text content to write.",
+                },
+            },
+            "required": ["filepath", "content"],
+        },
+    },
+}
+
+WORKER_TOOLS: List[Dict[str, Any]] = [WEB_SEARCH_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL]
 
 
 MAX_SEARCH_RESULTS = 5
 MAX_FILE_CHARS = 100_000
+MAX_WRITE_CHARS = 200_000
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# Files the LLM must never read, even though they live inside the sandbox.
+# Files the LLM must never touch, even though they live inside the sandbox.
 _denied_names = {".env"}
 _denied_suffixes = {".key", ".pem", ".p12"}
+
+
+def _sandbox_target(filepath: str) -> tuple[Path | None, str | None]:
+    """Resolve a model-supplied path inside the project, or return an error JSON."""
+    try:
+        candidate = (PROJECT_ROOT / filepath).resolve() if not Path(filepath).is_absolute() \
+            else Path(filepath).resolve()
+    except (OSError, ValueError):
+        return None, json.dumps({"status": "error", "filepath": filepath,
+                                 "error": "Invalid path."})
+    if not candidate.is_relative_to(PROJECT_ROOT):
+        return None, json.dumps(
+            {"status": "error", "filepath": filepath,
+             "error": "Access denied: path escapes the project workspace."}
+        )
+    if candidate.name in _denied_names or candidate.suffix in _denied_suffixes:
+        return None, json.dumps(
+            {"status": "error", "filepath": filepath,
+             "error": "Access denied: this file type is off-limits to the agent."}
+        )
+    return candidate, None
 
 
 def web_search(query: str) -> str:
@@ -112,19 +161,10 @@ def _decode_text(data: bytes) -> str:
 def read_file(filepath: str) -> str:
     """Read a text file from inside the project sandbox, safely."""
     try:
-        candidate = (PROJECT_ROOT / filepath).resolve() if not Path(filepath).is_absolute() \
-            else Path(filepath).resolve()
-
-        if not candidate.is_relative_to(PROJECT_ROOT):
-            return json.dumps(
-                {"status": "error", "filepath": filepath,
-                 "error": "Access denied: path escapes the project workspace."}
-            )
-        if candidate.name in _denied_names or candidate.suffix in _denied_suffixes:
-            return json.dumps(
-                {"status": "error", "filepath": filepath,
-                 "error": "Access denied: this file type is not readable by the agent."}
-            )
+        candidate, err = _sandbox_target(filepath)
+        if err:
+            return err
+        assert candidate is not None
         if not candidate.is_file():
             return json.dumps(
                 {"status": "error", "filepath": filepath,
@@ -151,7 +191,39 @@ def read_file(filepath: str) -> str:
         )
 
 
+def write_file(filepath: str, content: str) -> str:
+    """Write a text file inside the project sandbox, safely."""
+    try:
+        candidate, err = _sandbox_target(filepath)
+        if err:
+            return err
+        assert candidate is not None
+        text = str(content)
+        if len(text) > MAX_WRITE_CHARS:
+            return json.dumps(
+                {"status": "error", "filepath": filepath,
+                 "error": f"Content too large ({len(text)} chars, max {MAX_WRITE_CHARS})."}
+            )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        # Bytes, not text mode: Windows would translate \n to \r\n and the
+        # review step must read back exactly what the worker wrote.
+        candidate.write_bytes(text.encode("utf-8"))
+        return json.dumps(
+            {
+                "status": "ok",
+                "filepath": str(candidate.relative_to(PROJECT_ROOT)).replace("\\", "/"),
+                "bytes_written": len(text.encode("utf-8")),
+            }
+        )
+    except Exception as e:
+        return json.dumps(
+            {"status": "error", "filepath": filepath,
+             "error": f"File write failed: {type(e).__name__}: {e}"}
+        )
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., str]] = {
     "web_search": web_search,
     "read_file": read_file,
+    "write_file": write_file,
 }

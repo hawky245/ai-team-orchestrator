@@ -1,74 +1,54 @@
-/* UI / UX Design Tokens - Three-layer token architecture */
+/* JARVIS command-console theme — single dark-first token set */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
   :root {
-    /* Primitive tokens (raw values) */
-    --background: 0 0% 100%;
-    --foreground: 222 47% 11%;
-    --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222 47% 11%;
-    --primary: 260 60% 52%; /* Violet-purple accent for orchestrator theme */
-    --primary-foreground: 0 0% 100%;
-    --secondary: 210 40% 96%;
-    --secondary-foreground: 222 47% 11%;
-    --muted: 210 40% 96%;
-    --muted-foreground: 215 16% 47%;
-    --accent: 210 40% 96%;
-    --accent-foreground: 222 47% 11%;
-    --destructive: 0 84% 60%;
-    --destructive-foreground: 0 0% 100%;
-    --input: 214 32% 91%;
-    --ring: 260 60% 52%;
-    --border: 214 32% 91%;
+    /* Deep void surfaces (#07090E / #0A0D14) */
+    --background: 223 33% 4%;
+    --foreground: 210 30% 92%;
+    --card: 222 28% 7%;
+    --card-foreground: 210 30% 92%;
+    --popover: 222 30% 9%;
+    --popover-foreground: 210 30% 92%;
+
+    /* Neon cyan primary */
+    --primary: 184 100% 50%;
+    --primary-foreground: 223 40% 6%;
+
+    --secondary: 222 25% 12%;
+    --secondary-foreground: 210 25% 85%;
+    --muted: 222 25% 11%;
+    --muted-foreground: 215 18% 58%;
+    --accent: 222 25% 14%;
+    --accent-foreground: 210 30% 95%;
+
+    /* Signal colors */
+    --destructive: 342 100% 60%; /* crimson  */
+    --destructive-foreground: 223 40% 6%;
+    --success: 144 100% 50%;     /* emerald */
+    --success-foreground: 223 40% 6%;
+    --warning: 41 100% 50%;      /* amber   */
+    --warning-foreground: 223 40% 6%;
+    --error: 342 100% 60%;
+    --info: 187 92% 55%;
+
+    --input: 222 25% 16%;
+    --ring: 184 100% 50%;
+    --border: 220 22% 16%;
     --radius: 0.5rem;
 
-    /* Success/error/colors */
-    --success: 142 76% 36%;
-    --success-foreground: 0 0% 100%;
-    --warning: 38 92% 50%;
-    --warning-foreground: 0 0% 100%;
-    --error: 0 84% 60%;
-    --error-foreground: 0 0% 100%;
-    --info: 210 100% 50%;
+    --font-sans: "Inter", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, monospace;
 
-    /* Shadows */
-    --shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
-    --shadow-card-hover: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
-    --shadow-glow: 0 0 20px rgb(260 60% 52% / 0.3);
-  }
-
-  .dark {
-    /* Dark mode primitives */
-    --background: 222 47% 11%;
-    --foreground: 210 40% 98%;
-    --card: 222 47% 11%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222 47% 11%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 260 60% 52%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 217 33% 17%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217 33% 17%;
-    --muted-foreground: 215 20% 65%;
-    --accent: 217 33% 17%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 0 0% 98%;
-    --input: 217 33% 17%;
-    --ring: 260 60% 52%;
-    --border: 217 33% 17%;
-    --radius: 0.5rem;
-
-    /* Dark mode shadows */
+    /* Shadows / glows */
     --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.5);
     --shadow-card-hover: 0 10px 15px -3px rgb(0 0 0 / 0.5), 0 4px 6px -4px rgb(0 0 0 / 0.5);
-    --shadow-glow: 0 0 20px rgb(260 60% 52% / 0.2);
+    --shadow-glow: 0 0 24px hsl(184 100% 50% / 0.25);
+    --shadow-glow-amber: 0 0 24px hsl(41 100% 50% / 0.3);
+    --shadow-glow-emerald: 0 0 24px hsl(144 100% 50% / 0.3);
+    --shadow-glow-crimson: 0 0 24px hsl(342 100% 60% / 0.35);
   }
 
   * {
@@ -76,12 +56,109 @@
   }
   body {
     @apply bg-background text-foreground antialiased;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -10%, hsl(184 100% 50% / 0.06), transparent),
+      radial-gradient(ellipse 60% 40% at 85% 110%, hsl(222 60% 30% / 0.15), transparent);
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: hsl(184 100% 50% / 0.35);
+  }
+
+  /* Slim HUD scrollbars */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(220 22% 22%);
+    border-radius: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
   }
 }
 
-/* Dark mode transition */
-@layer base {
-  *, *::before, *::after {
-    @apply transition-colors duration-200;
+@layer components {
+  .hud-panel {
+    @apply rounded-xl border border-border/80 bg-card/80 backdrop-blur-md;
+    box-shadow: 0 0 0 1px hsl(184 100% 50% / 0.04), 0 8px 32px rgb(0 0 0 / 0.45);
   }
+
+  .hud-label {
+    @apply text-2xs font-semibold uppercase tracking-[0.18em] text-muted-foreground;
+  }
+
+  .hud-input {
+    @apply h-9 rounded-md border border-input bg-secondary/60 px-3 text-sm text-foreground placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring;
+  }
+
+  .neon-text {
+    color: hsl(184 100% 60%);
+    text-shadow: 0 0 12px hsl(184 100% 50% / 0.55);
+  }
+
+  /* Pulse ring used by running task nodes */
+  .pulse-ring {
+    position: relative;
+  }
+  .pulse-ring::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: inherit;
+    border: 1px solid hsl(184 100% 50% / 0.7);
+    animation: pulse-expand 1.8s ease-out infinite;
+    pointer-events: none;
+  }
+
+  @keyframes pulse-expand {
+    0% { transform: scale(0.97); opacity: 0.9; }
+    70% { transform: scale(1.045); opacity: 0; }
+    100% { transform: scale(1.045); opacity: 0; }
+  }
+
+  /* Signal energy flow along active wires */
+  .wire-flow {
+    stroke-dasharray: 6 14;
+    stroke-dashoffset: 0;
+    animation: wire-dash 0.9s linear infinite;
+  }
+  @keyframes wire-dash {
+    to { stroke-dashoffset: -20; }
+  }
+
+  .wire-idle {
+    stroke-dasharray: 2 8;
+  }
+
+  .node-flash-fail {
+    animation: flash-crimson 0.9s ease-in-out infinite;
+  }
+  @keyframes flash-crimson {
+    0%, 100% { border-color: hsl(342 100% 60% / 0.9); box-shadow: 0 0 14px hsl(342 100% 60% / 0.35); }
+    50% { border-color: hsl(342 100% 60% / 0.35); box-shadow: 0 0 4px hsl(342 100% 60% / 0.15); }
+  }
+
+  /* Subtle scanline film over the void */
+  .crt-film {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 5;
+    background: repeating-linear-gradient(
+      to bottom,
+      transparent 0px,
+      transparent 3px,
+      hsl(184 100% 50% / 0.012) 4px
+    );
+  }
+}
+
+@layer utilities {
+  .glow-cyan { box-shadow: var(--shadow-glow); }
+  .glow-amber { box-shadow: var(--shadow-glow-amber); }
+  .glow-emerald { box-shadow: var(--shadow-glow-emerald); }
+  .glow-crimson { box-shadow: var(--shadow-glow-crimson); }
 }

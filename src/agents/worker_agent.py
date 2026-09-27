@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from src.providers.base_provider import AbstractLLMProvider, ProviderResponse
+from src.providers.base_provider import NvidiaNimProvider, ProviderResponse
 from src.schemas.models import Task, WorkerResult
 from src.tools.worker_tools import TOOL_REGISTRY, WORKER_TOOLS
 from src.utils.json_parser import _extract_and_parse_json
@@ -17,9 +17,8 @@ WORKER_SCHEMA = {
     "type": "object",
     "properties": {
         "raw_output": {"type": "string"},
-        "artifacts": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["raw_output", "artifacts"],
+    "required": ["raw_output"],
 }
 
 
@@ -45,7 +44,7 @@ Rules:
 10. If tools (e.g. web_search, read_file) are available, you may call them to gather information first. After all tool results are returned, produce ONLY the final JSON object as your answer.
 """
 
-    def __init__(self, provider: AbstractLLMProvider) -> None:
+    def __init__(self, provider: NvidiaNimProvider) -> None:
         self.provider = provider
 
     async def execute(self, task: Task, on_tool_call=None, on_retry=None) -> WorkerResult:
@@ -98,38 +97,10 @@ Rules:
         data = _extract_and_parse_json(raw_text)
 
         raw_output = data.get("raw_output", "")
-        artifacts = data.get("artifacts", [])
+        if not str(raw_output).strip():
+            # Valid JSON with an empty payload is NOT a completed step: raise
+            # so the orchestrator's retry + model-rotation logic engages
+            # instead of the task "succeeding" with nothing.
+            raise ValueError("worker returned an empty raw_output")
 
-        # Normalize artifacts into Artifact objects (for consistency)
-        normalized_artifacts: list = []
-
-        for a in artifacts:
-            if isinstance(a, str):
-                normalized_artifacts.append(
-                    {
-                        "artifact_type": "text",
-                        "content": a,
-                    }
-                )
-
-            elif isinstance(a, dict):
-                normalized_artifacts.append(
-                    {
-                        "artifact_type": a.get("artifact_type", "text"),
-                        "filename": a.get("filename"),
-                        "content": a.get("content", ""),
-                    }
-                )
-
-            else:
-                normalized_artifacts.append(
-                    {
-                        "artifact_type": "text",
-                        "content": str(a),
-                    }
-                )
-
-        return WorkerResult(
-            raw_output=raw_output,
-            artifacts=normalized_artifacts,
-        )
+        return WorkerResult(raw_output=raw_output)

@@ -11,13 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import main
 from main import AI_TEAM_ORCHESTRATOR
 from src.database import RunModel, TaskModel, get_db
 from src.providers.base_provider import (
     NvidiaNimProvider,
     ProviderConfig,
     ProviderError,
+    detect_provider_label,
 )
 
 app = FastAPI()
@@ -34,20 +34,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class ExecutionRequest(BaseModel):
-    goal: str
-
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "AI Team Orchestrator API is running"}
-
-@app.post("/api/execute")
-def execute(request: ExecutionRequest):
-    try:
-        result = main.run_orchestrator(request.goal)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/runs")
 def list_runs(db: Session = Depends(get_db)):
@@ -65,15 +54,12 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
         "tasks": [task.to_dict() for task in tasks]
     }
 
-@app.get("/api/models")
-async def list_available_models(api_key: str | None = None):
-    """Proxy the provider's model catalogue for the dashboard's model picker.
+class ModelsRequest(BaseModel):
+    api_key: str | None = None
 
-    With `api_key` the list reflects that key's access; without it the
-    server's .env key is used. Invalid keys return a clean 400 — the key
-    itself is never echoed back. (Caveat: query-string keys can land in
-    access logs; the dashboard also accepts keys via the run payload.)
-    """
+async def _models_payload(api_key: str | None) -> dict:
+    """List models for a key (or the server .env key when None). The key is
+    never echoed back; failures surface as a clean 400 without key material."""
     config = ProviderConfig(
         model_id=os.getenv("LLM_MODEL_ID", "unused-for-listing"),
         temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
@@ -87,7 +73,30 @@ async def list_available_models(api_key: str | None = None):
     return {
         "models": models,
         "source": "custom_key" if api_key else "server_env",
+        # Display-only label derived from the key prefix / base URL host.
+        # No key material is ever returned.
+        "provider": detect_provider_label(api_key),
+        # The model the planner runs on by default; the dashboard warns when
+        # a fetched catalogue cannot serve it (planning would 404).
+        "default_model": os.getenv("LLM_MODEL_ID", ""),
     }
+
+@app.get("/api/models")
+async def list_available_models():
+    """Server-key catalogue only. Keys must travel in the POST body —
+    query-string keys land verbatim in every proxy/access log."""
+    return await _models_payload(None)
+
+@app.post("/api/models")
+async def list_available_models_for_key(payload: ModelsRequest):
+    """Proxy the provider's model catalogue for a user-supplied key.
+
+    The key is read from the JSON body so it never appears in a URL, and
+    is therefore never written to access logs. Invalid keys return a clean
+    400 that does not echo the key.
+    """
+    key = (payload.api_key or "").strip() or None
+    return await _models_payload(key)
 
 @app.websocket("/ws/execute")
 async def websocket_execute(websocket: WebSocket):
@@ -128,6 +137,24 @@ async def websocket_execute(websocket: WebSocket):
             }
             if isinstance(raw_plan_models, dict) else None
         )
+        # model -> api_key map so each task's calls use the key that served it
+        raw_model_keys = request_data.get("model_keys")
+        model_keys = (
+            {
+                str(k): str(v)
+                for k, v in raw_model_keys.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+            if isinstance(raw_model_keys, dict) else None
+        )
+        # The dashboard's fetched catalogue: the planner is constrained to it
+        # (prompt whitelist) and every model assignment is validated against
+        # it before any wave runs. Malformed entries are dropped.
+        raw_avail = request_data.get("available_models")
+        available_models = (
+            [s for m in raw_avail if isinstance(m, str) and (s := m.strip())]
+            if isinstance(raw_avail, list) else None
+        )
 
         if not goal:
             await safe_send({
@@ -147,6 +174,8 @@ async def websocket_execute(websocket: WebSocket):
                 model_selection=model_selection,
                 review_plan=review_plan,
                 plan_models=plan_models,
+                model_keys=model_keys,
+                available_models=available_models,
             )
         )
 
@@ -175,6 +204,10 @@ async def websocket_execute(websocket: WebSocket):
                                 "reason": "No task is currently waiting for input",
                             },
                         })
+                elif msg.get("type") == "stop_run":
+                    # Dashboard STOP: abandon at the next task/wave boundary.
+                    orchestrator.request_stop()
+                    await safe_send({"type": "stop_requested", "data": {}})
                 elif msg.get("type") == "plan_model_assignment":
                     pa_data = msg.get("data") or {}
                     assignments = pa_data.get("assignments")
@@ -207,12 +240,8 @@ async def websocket_execute(websocket: WebSocket):
         # Pipeline finished normally; no more feedback can arrive.
         listen_task.cancel()
         result = await run_task
-
-        # Send final result
-        await safe_send({
-            "type": "execution_complete",
-            "data": result
-        })
+        # The orchestrator already streamed execution_completed + run_completed
+        # frames with the summary and final output; nothing else to send.
 
     except WebSocketDisconnect:
         # Client disconnected — nothing to send or close

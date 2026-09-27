@@ -23,13 +23,8 @@ from src.schemas.models import Task
 # 1. Wave planning
 # ---------------------------------------------------------------------------
 
-def T(tid, deps=(), par=False):
-    return Task(
-        task_id=tid,
-        description=f"task {tid}",
-        dependencies=list(deps),
-        is_parallel=par,
-    )
+def T(tid, deps=()):
+    return Task(task_id=tid, description=f"task {tid}", dependencies=list(deps))
 
 
 def wave_ids(waves):
@@ -42,10 +37,6 @@ def test_wave_planning():
         [T("t1"), T("t2", ["t1"]), T("t3", ["t1"]), T("t4", ["t2", "t3"])]
     )
     assert wave_ids(waves) == [["t1"], ["t2", "t3"], ["t4"]], waves
-
-    # is_parallel overrides declared dependencies
-    waves = orch_main.plan_execution_waves([T("t1"), T("t2", ["t1"], par=True)])
-    assert wave_ids(waves) == [["t1", "t2"]], waves
 
     # Unknown / self dependencies never block
     waves = orch_main.plan_execution_waves([T("t1", ["zz"]), T("t2", ["t2"])])
@@ -64,7 +55,7 @@ def test_wave_planning():
     # Fully independent plan collapses into a single wide wave
     waves = orch_main.plan_execution_waves([T("t1"), T("t2"), T("t3")])
     assert wave_ids(waves) == [["t1", "t2", "t3"]], waves
-    print("PASS  wave planning (diamond / is_parallel / bad deps / cycle / sequential / wide)")
+    print("PASS  wave planning (diamond / bad deps / cycle / sequential / wide)")
 
 
 # ---------------------------------------------------------------------------
@@ -85,9 +76,9 @@ def test_planner_parsing():
         ],
     }))
     t1, t2, t3 = plan.tasks
-    assert t1.is_parallel is True and t1.dependencies == []
-    assert t2.is_parallel is False and t2.dependencies == ["t1"]
-    assert t3.is_parallel is False and t3.dependencies == ["t1", "t2"]
+    assert t1.dependencies == []
+    assert t2.dependencies == ["t1"]
+    assert t3.dependencies == ["t1", "t2"]
     assert plan.execution_order == "dag"
 
     # Missing optional fields must not explode
@@ -95,8 +86,8 @@ def test_planner_parsing():
         "summary": "s", "execution_order": "sequential",
         "tasks": [{"task_id": f"t{i}", "description": "d"} for i in (1, 2, 3)],
     }))
-    assert all(t.dependencies == [] and t.is_parallel is False for t in plan.tasks)
-    print("PASS  planner parsing (depends_on, is_parallel, alias merge, missing optionals)")
+    assert all(t.dependencies == [] for t in plan.tasks)
+    print("PASS  planner parsing (depends_on, alias merge, missing optionals)")
 
 
 # ---------------------------------------------------------------------------
@@ -210,14 +201,10 @@ def test_concurrent_run():
     wall = time.monotonic() - t0
 
     # --- scheduling evidence -------------------------------------------------
+    # max_active==3 is decisive: sequential execution can never have 3 live
+    # workers at once. Wall time is deliberately not asserted (noisy on Windows).
     assert provider.max_active_workers == 3, (
         f"expected 3 concurrent workers in wave 1, saw {provider.max_active_workers}"
-    )
-    sequential_floor = 4 * WORKER_DELAY
-    # max_active==3 is the hard overlap proof; wall time is a noisy secondary
-    # check (Windows timers), so the margin only needs to exclude sequential.
-    assert wall < sequential_floor * 0.95, (
-        f"run took {wall:.2f}s; sequential floor is {sequential_floor:.2f}s — not concurrent"
     )
 
     # task_started for all three independents must precede any of their completions
@@ -253,18 +240,19 @@ def test_concurrent_run():
     for expected in (
         "execution_started", "planning_completed", "task_started",
         "task_worker_completed", "task_review_passed", "run_completed",
-        "execution_completed",
     ):
         assert expected in types, (expected, sorted(types))
+    assert "execution_completed" not in types, "completion frames were merged into run_completed"
     rc = next(f for f in ws.frames if f["type"] == "run_completed")
     assert rc["data"]["final_output"] == "OUTPUT[merge all]", rc
+    assert rc["data"]["summary"]["completed_tasks"] == 4, rc
     assert all("data" not in f or isinstance(f["data"], dict) for f in ws.frames)
 
     assert result["summary"]["completed_tasks"] == 4
     print(
-        f"PASS  concurrent run: {provider.max_active_workers} workers overlapped, "
-        f"{wall:.2f}s wall vs {sequential_floor:.2f}s sequential floor, "
-        f"{len(ws.frames)} serialized frames, DAG order + dep-context verified"
+        f"PASS  concurrent run: {provider.max_active_workers} workers overlapped "
+        f"({wall:.2f}s), {len(ws.frames)} serialized frames, "
+        "DAG order + dep-context verified"
     )
 
 

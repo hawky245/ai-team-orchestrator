@@ -119,8 +119,9 @@ def run_with_selection(selection):
 
 def test_forced_selection():
     provider, ws, result = run_with_selection("meta/forced")
-    assert provider.calls[0] == ("planner", None, None), \
-        "the planner itself must stay on the global model"
+    assert provider.calls[0] == ("planner", None, "meta/forced"), \
+        "a forced selection routes the PLANNER call too — a user key without " \
+        "access to the env model would otherwise die before any task runs"
     for kind, desc, model in provider.calls[1:]:
         assert model == "meta/forced", (kind, desc, model)
     # it also beats the planner's own t2 override
@@ -130,12 +131,14 @@ def test_forced_selection():
     assert frame and frame["data"]["model"] == "meta/forced"
     assert frame["data"]["task_count"] == 3
     assert result["summary"]["completed_tasks"] == 3
-    print("PASS  forced selection overrides every task (incl. planner's own override); planner call untouched")
+    print("PASS  forced selection routes the planner call and every task onto the chosen model")
 
 
 def test_auto_selection_respects_planner():
     for selection in (None, "", "auto", "Auto"):
         provider, ws, _ = run_with_selection(selection)
+        assert provider.calls[0] == ("planner", None, None), \
+            f"auto must leave the planner on the global model ({selection!r})"
         models = {(kind, desc): model for kind, desc, model in provider.calls if kind != "planner"}
         assert models[("worker", "two")] == "planner/pick", selection
         assert models[("reviewer", "two")] == "planner/pick", selection

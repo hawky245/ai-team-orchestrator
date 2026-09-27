@@ -7,7 +7,7 @@ from typing import Any, List
 
 from pydantic import BaseModel, Field
 
-from src.providers.base_provider import AbstractLLMProvider, ProviderResponse
+from src.providers.base_provider import NvidiaNimProvider, ProviderResponse
 from src.schemas.models import ReviewResult, Task
 from src.utils.json_parser import _extract_and_parse_json
 
@@ -44,9 +44,14 @@ RULES:
   output makes a choice only the user can endorse, or approval is required
   before proceeding), set "requires_user_input": true and put your question
   in "feedback".
+- You have NO access to the filesystem or the internet. If the task involves
+  a file or external source, judge ONLY from the text actually present in
+  the worker output and provided context. Never narrate having opened,
+  read, or verified something you cannot see; if the evidence is absent,
+  say exactly that and set "approved": false.
 """
 
-    def __init__(self, provider: AbstractLLMProvider) -> None:
+    def __init__(self, provider: NvidiaNimProvider) -> None:
         self.provider = provider
 
     async def evaluate(self, task: Task, worker_result: Any) -> ReviewResult:

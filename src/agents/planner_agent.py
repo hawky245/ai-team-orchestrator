@@ -7,8 +7,8 @@ from typing import Any, List
 
 from pydantic import BaseModel, Field
 
-from src.providers.base_provider import AbstractLLMProvider, ProviderResponse
-from src.schemas.models import Goal, PlannerOutput, Task, TaskPlan
+from src.providers.base_provider import NvidiaNimProvider, ProviderResponse
+from src.schemas.models import PlannerOutput, Task, TaskPlan
 from src.utils.json_parser import _extract_and_parse_json
 
 
@@ -31,7 +31,6 @@ PLANNER_SCHEMA = {
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "is_parallel": {"type": "boolean"},
                     "requires_user_input": {"type": "boolean"},
                     "model_override": {"type": "string"},
                     "context": {"type": "object"},
@@ -56,9 +55,9 @@ You MUST respond with ONLY a single JSON object that matches this exact schema (
 {
   "summary": "Brief summary of the overall plan",
   "tasks": [
-    {"task_id": "t1", "description": "Specific, actionable task description", "depends_on": [], "is_parallel": false, "context": {}},
-    {"task_id": "t2", "description": "Independent task, needs no other output", "depends_on": [], "is_parallel": true, "context": {}},
-    {"task_id": "t3", "description": "Task that combines t1 and t2", "depends_on": ["t1", "t2"], "is_parallel": false, "context": {}}
+    {"task_id": "t1", "description": "Specific, actionable task description", "depends_on": [], "context": {}},
+    {"task_id": "t2", "description": "Independent task, needs no other output", "depends_on": [], "context": {}},
+    {"task_id": "t3", "description": "Task that combines t1 and t2", "depends_on": ["t1", "t2"], "context": {}}
   ],
   "execution_order": "dag"
 }
@@ -68,8 +67,8 @@ RULES:
 - Tasks should be concrete and specific (not vague).
 - "depends_on" lists the task IDs whose output this task needs before it can start.
 - The orchestrator runs tasks CONCURRENTLY whenever their depends_on allow it:
-  give a task "depends_on": [] (and optionally "is_parallel": true) ONLY when it
-  genuinely does not need any other task's output.
+  give a task "depends_on": [] ONLY when it genuinely does not need any
+  other task's output.
 - Add depends_on entries for every task that builds on, polishes, or reviews
   another task's output.
 - If a task is ambiguous, risky, or needs explicit user approval before the
@@ -77,7 +76,10 @@ RULES:
   will pause that task and ask the user for direction first.
 - Optionally set "model_override": "<provider/model-id>" on a task to run its
   worker and reviewer on that model instead of the default. Use it only when
-  the goal explicitly names a model for some part of the work.
+  the goal explicitly names a model for some part of the work. The model must
+  be a TEXT-GENERATION (chat) model — never an audio, transcription, TTS,
+  image, vision, embedding, or classifier model (e.g. whisper, orpheus, fuyu,
+  nvl-, embed). When in doubt, leave model_override unset.
 - Set "execution_order" to "dag" when the plan contains a dependency structure
   (the usual case). Use "sequential" only when EVERY task requires the output
   of the task directly before it.
@@ -86,16 +88,55 @@ RULES:
 - Your entire response must be valid JSON that can be parsed directly.
 """
 
-    def __init__(self, provider: AbstractLLMProvider) -> None:
+    def __init__(self, provider: NvidiaNimProvider) -> None:
         self.provider = provider
 
-    async def execute(self, goal: str) -> PlannerOutput:
-        """Run the planner on the given goal and return a structured plan."""
+    # The whitelist goes into the prompt verbatim; big catalogues (OpenRouter
+    # lists 400+) would blow up the planning call, so only the first N are
+    # shown. Validation in the orchestrator still checks the FULL list.
+    PROMPT_MODEL_CAP = 80
+
+    def _system_prompt(self, available_models: list[str] | None) -> str:
+        if not available_models:
+            return self.SYSTEM_PROMPT
+        shown = available_models[: self.PROMPT_MODEL_CAP]
+        more = ""
+        if len(available_models) > len(shown):
+            more = (
+                f"\n(The list is truncated to the first {len(shown)} of "
+                f"{len(available_models)}; every one of those is valid.)"
+            )
+        return (
+            self.SYSTEM_PROMPT
+            + "\nMODEL AVAILABILITY CONSTRAINT:\n"
+            + "You are only allowed to assign models from the following list of "
+            + "available models: "
+            + json.dumps(shown)
+            + ". Do not assign any model outside this list under any circumstances."
+            + " Leave \"model_override\" unset (or empty) to use the default model.\n"
+            + more
+        )
+
+    async def execute(
+        self,
+        goal: str,
+        model: str | None = None,
+        available_models: list[str] | None = None,
+    ) -> PlannerOutput:
+        """Run the planner on the given goal and return a structured plan.
+
+        `model` (from the dashboard's run-level choice) overrides the env
+        model for the planning call itself — a user key that cannot access
+        the server's default model would otherwise fail before routing.
+        `available_models` additionally whitelists which models the plan may
+        reference in `model_override` (strict system-prompt constraint).
+        """
         prompt = f"User Goal:\n{goal}\n\nReturn the task plan as JSON."
         response: ProviderResponse = await self.provider.generate(
-            system_prompt=self.SYSTEM_PROMPT,
+            system_prompt=self._system_prompt(available_models),
             user_prompt=prompt,
             schema=PLANNER_SCHEMA,
+            model=model,
         )
 
         plan = self._parse_plan(response.content)
@@ -141,10 +182,6 @@ RULES:
             if not isinstance(context, dict):
                 context = {}
 
-            is_parallel = t.get("is_parallel", False)
-            if not isinstance(is_parallel, bool):
-                is_parallel = bool(is_parallel)
-
             requires_user_input = t.get("requires_user_input", False)
             if not isinstance(requires_user_input, bool):
                 requires_user_input = bool(requires_user_input)
@@ -158,7 +195,6 @@ RULES:
                     task_id=task_id,
                     description=description,
                     dependencies=raw_deps,
-                    is_parallel=is_parallel,
                     requires_user_input=requires_user_input,
                     model_override=model_override,
                     context=context,

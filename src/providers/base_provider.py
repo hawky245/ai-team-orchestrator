@@ -1,12 +1,7 @@
-"""Provider abstraction layer for LLM calls.
-
-All providers must implement the `AbstractLLMProvider` interface.
-The default implementation uses NVIDIA NIM via an OpenAI-compatible client.
-"""
+"""LLM provider: an OpenAI-compatible client for NVIDIA NIM, Groq, OpenRouter, etc."""
 
 from __future__ import annotations
 
-import abc
 import asyncio
 import os
 from typing import Any
@@ -24,18 +19,9 @@ class ProviderConfig(BaseModel):
     max_tokens: int = Field(default=1024, ge=1)
 
 
-class ProviderUsage(BaseModel):
-    """Token usage information returned by a provider."""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-
-
 class ProviderResponse(BaseModel):
-    """Normalized response from any provider."""
+    """Normalized response from the provider."""
     content: str
-    usage: ProviderUsage = ProviderUsage()
-    finish_reason: str | None = None
 
 
 class ProviderError(Exception):
@@ -82,26 +68,108 @@ def _is_transient_error(exc: Exception) -> bool:
     return isinstance(status, int) and status in TRANSIENT_STATUS_CODES
 
 
-class AbstractLLMProvider(abc.ABC):
-    """Interface that every LLM provider must implement."""
-
-    @property
-    @abc.abstractmethod
-    def name(self) -> str:
-        pass
-
-    @abc.abstractmethod
-    async def generate(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        schema: dict = None,
-        **kwargs: Any,
-    ) -> ProviderResponse:
-        pass
+def _is_max_tokens_error(exc: Exception) -> bool:
+    """400 rejecting the requested max_tokens size (model caps it lower)."""
+    return isinstance(exc, openai.BadRequestError) and "max_tokens" in str(exc).lower()
 
 
-class NvidiaNimProvider(AbstractLLMProvider):
+def _is_tool_unsupported_error(exc: Exception) -> bool:
+    """400 saying this model cannot do function/tool calling at all."""
+    if not isinstance(exc, openai.BadRequestError):
+        return False
+    msg = str(exc).lower()
+    return "tool" in msg and "support" in msg
+
+
+def _friendly_auth_error(exc: Exception) -> "ProviderError | None":
+    """Turn raw 401/403s into an actionable message, never echoing the key.
+
+    Worth calling out explicitly because several providers serve their model
+    LIST publicly: an invalid key still fills the dashboard's Model Bay, so
+    the first real completion is where the key actually fails.
+    """
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return ProviderError(
+            "The provider rejected your API key (401/403). This provider lists "
+            "its models publicly, so the Model Bay can look fine even with a "
+            "bad key — the first real request proves it. Re-add the key in the "
+            "Key Ring or remove it to use the server key."
+        )
+    return None
+
+
+# Key-prefix and host fingerprints used to label which provider a model list
+# came from. Returns a display name only — never any key material.
+_KEY_PREFIXES = (
+    ("nvapi-", "NVIDIA"),
+    ("sk-or-", "OpenRouter"),
+    ("gsk_", "Groq"),
+    ("sk-ant-", "Anthropic"),
+    ("AIza", "Google Gemini"),
+    ("sk-", "OpenAI"),
+)
+_HOST_HINTS = (
+    ("nvidia.com", "NVIDIA"),
+    ("openrouter.ai", "OpenRouter"),
+    ("groq.com", "Groq"),
+    ("anthropic.com", "Anthropic"),
+    ("openai.com", "OpenAI"),
+    ("googleapis.com", "Google Gemini"),
+)
+
+
+def detect_provider_label(api_key: str | None) -> str:
+    """Human-readable provider name for the dashboard badge."""
+    key = (api_key or "").strip()
+    if key:
+        for prefix, label in _KEY_PREFIXES:
+            if key.startswith(prefix):
+                return label
+        return "Custom endpoint"
+    base = (os.getenv("LLM_BASE_URL") or "").lower()
+    if not base:
+        return "OpenAI"
+    if "localhost" in base or "127.0.0.1" in base:
+        return "Local"
+    for host, label in _HOST_HINTS:
+        if host in base:
+            return label
+    return "Custom endpoint"
+
+
+# Public OpenAI-compatible endpoints for keys that are unambiguously
+# identifiable by prefix. Ordered most-specific first; a bare `sk-` is NOT
+# routed here because it is ambiguous (legacy OpenAI, DeepSeek, Moonshot,
+# API gateways all use it) and keeps the configured base URL instead.
+_PROVIDER_BASE_URLS = (
+    ("nvapi-", "https://integrate.api.nvidia.com/v1"),
+    ("gsk_", "https://api.groq.com/openai/v1"),
+    ("sk-or-", "https://openrouter.ai/api/v1"),
+    ("sk-ant-", "https://api.anthropic.com/v1"),
+    ("AIza", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+    ("sk-proj-", "https://api.openai.com/v1"),
+    ("sk-svcacct-", "https://api.openai.com/v1"),
+)
+
+
+def base_url_for_key(api_key: str | None, default: str | None = None) -> str | None:
+    """The endpoint this key should talk to.
+
+    A recognisable key prefix wins over `default` — a Groq key is useless at
+    the NVIDIA URL and vice versa. Local endpoints (dev proxies, Ollama,
+    LM Studio) are always kept as configured.
+    """
+    base = (default or "").lower()
+    if "localhost" in base or "127.0.0.1" in base:
+        return default
+    key = (api_key or "").strip()
+    for prefix, url in _PROVIDER_BASE_URLS:
+        if key.startswith(prefix):
+            return url
+    return default
+
+
+class NvidiaNimProvider:
     """Provider that talks to any OpenAI-compatible LLM via the OpenAI Python client.
 
     Supports rotating through multiple API keys (comma‑separated in ``LLM_API_KEY``)
@@ -127,6 +195,11 @@ class NvidiaNimProvider(AbstractLLMProvider):
         self._key_index = 0
 
         base_url = os.getenv("LLM_BASE_URL")
+        if api_key and api_key.strip():
+            # A user-supplied key knows its own provider: route to that
+            # endpoint instead of the env one (e.g. a Groq key at NVIDIA's
+            # URL would list/serve the wrong catalogue entirely).
+            base_url = base_url_for_key(self.api_keys[0], base_url)
 
         # Initialise client with the first key; we'll rotate per request.
         client_kwargs: dict = {"api_key": self.api_keys[0]}
@@ -134,6 +207,31 @@ class NvidiaNimProvider(AbstractLLMProvider):
             client_kwargs["base_url"] = base_url
 
         self.client = openai.OpenAI(**client_kwargs)
+        self._base_url = base_url
+
+        # Milestone 15: model-id -> api-key map for multi-provider runs.
+        # Tasks whose model was fetched with a specific key keep using it.
+        self.model_keys: dict[str, str] = {}
+        self._key_clients: dict[str, Any] = {}
+
+    def _client_for_key(self, key: str):
+        """Cached client for a specific key, pointed at that key's provider."""
+        client = self._key_clients.get(key)
+        if client is None:
+            kwargs: dict = {"api_key": key}
+            base = base_url_for_key(key, self._base_url)
+            if base:
+                kwargs["base_url"] = base
+            client = openai.OpenAI(**kwargs)
+            self._key_clients[key] = client
+        return client
+
+    def _client_for_model(self, model: str | None):
+        """Cached client for the key mapped to this model, else the default."""
+        key = self.model_keys.get(model or "")
+        if not key:
+            return self.client
+        return self._client_for_key(key)
 
     def _next_api_key(self) -> str:
         """Return the next API key in a round‑robin fashion."""
@@ -176,6 +274,8 @@ class NvidiaNimProvider(AbstractLLMProvider):
     FALLBACK_MAX_RETRIES = 2
     RETRY_BASE_DELAY = 1.0
 
+    MAX_TOKENS_FLOOR = 512
+
     async def _create_completion(self, model: str, request_kwargs: dict):
         """Perform the HTTP call in a worker thread.
 
@@ -183,11 +283,32 @@ class NvidiaNimProvider(AbstractLLMProvider):
         block the event loop for the whole round-trip, silently serializing
         "concurrent" workers and delaying WebSocket frames. to_thread keeps
         the loop free so waves truly overlap.
+
+        When the model has an entry in `model_keys` (multi-key runs), the
+        cached client for that key serves the request; otherwise the default
+        rotated client is used.
+
+        Small-cap models reject the anti-truncation max_tokens floor with a
+        400 naming the parameter; halve and retry in place until the floor,
+        then surface the error.
         """
-        return await asyncio.to_thread(
-            self.client.chat.completions.create,
-            **{**request_kwargs, "model": model},
-        )
+        while True:
+            try:
+                return await asyncio.to_thread(
+                    self._client_for_model(model).chat.completions.create,
+                    **{**request_kwargs, "model": model},
+                )
+            except openai.BadRequestError as e:
+                current = request_kwargs.get("max_tokens") or 0
+                if not _is_max_tokens_error(e) or current <= self.MAX_TOKENS_FLOOR:
+                    raise
+                request_kwargs["max_tokens"] = max(
+                    self.MAX_TOKENS_FLOOR, current // 2
+                )
+                print(
+                    f"[ADAPT] '{model}' rejected max_tokens={current}; "
+                    f"retrying at {request_kwargs['max_tokens']}"
+                )
 
     async def _create_with_retries(
         self,
@@ -270,9 +391,9 @@ class NvidiaNimProvider(AbstractLLMProvider):
 
         # Rotate API key before each request to spread load / avoid rate limits.
         if len(self.api_keys) > 1:
-            # Re‑initialise client with the next key – cheap because OpenAI client
-            # only stores the key in its config.
-            self.client = openai.OpenAI(api_key=self._next_api_key(), **({"base_url": os.getenv("LLM_BASE_URL")} if os.getenv("LLM_BASE_URL") else {}))
+            # Rotation can mix providers (comma-separated keys): send each key
+            # to its own endpoint via the cached per-key client.
+            self.client = self._client_for_key(self._next_api_key())
 
         temp = kwargs.get("temperature", self.config.temperature)
         on_retry = kwargs.get("on_retry")
@@ -314,44 +435,18 @@ class NvidiaNimProvider(AbstractLLMProvider):
             if not textual.strip():
                 raise ProviderError("LLM response content was empty")
 
-            usage_data = getattr(response, "usage", None)
-
-            if usage_data:
-                prompt_tok = getattr(
-                    usage_data,
-                    "prompt_tokens",
-                    0,
-                )
-                comp_tok = getattr(
-                    usage_data,
-                    "completion_tokens",
-                    0,
-                )
-            else:
-                prompt_tok = 0
-                comp_tok = 0
-
-            return ProviderResponse(
-                content=textual,
-                usage=ProviderUsage(
-                    prompt_tokens=prompt_tok,
-                    completion_tokens=comp_tok,
-                    total_tokens=prompt_tok + comp_tok,
-                ),
-                finish_reason=choice.finish_reason,
-            )
+            return ProviderResponse(content=textual)
 
         except ProviderError:
             # Re‑raise ProviderError as‑is (no prefix wrapping)
             raise
         except Exception as e:
+            friendly = _friendly_auth_error(e)
+            if friendly is not None:
+                raise friendly from e
             raise ProviderError(
                 f"LLM provider request failed: {str(e)}"
             )
-
-    @property
-    def name(self) -> str:
-        return "nvidia_nim"
 
     MAX_TOOL_ROUNDS = 5
 
@@ -383,8 +478,9 @@ class NvidiaNimProvider(AbstractLLMProvider):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        total_prompt = 0
-        total_comp = 0
+        # Flipped off when the model 400s on function calling; the per-round
+        # kwargs are rebuilt, so a one-shot pop would be undone.
+        tools_enabled = bool(tools)
 
         for round_no in range(self.MAX_TOOL_ROUNDS + 1):
             request_kwargs = {
@@ -392,13 +488,10 @@ class NvidiaNimProvider(AbstractLLMProvider):
                 "messages": messages,
                 "temperature": self.config.temperature,
                 "max_tokens": max(self.config.max_tokens, 8192),
-                "tools": tools,
-                "tool_choice": "auto",
             }
-            if round_no == self.MAX_TOOL_ROUNDS:
-                # Tool budget exhausted — force a final synthesized answer.
-                request_kwargs.pop("tools")
-                request_kwargs.pop("tool_choice")
+            if tools_enabled and round_no < self.MAX_TOOL_ROUNDS:
+                request_kwargs["tools"] = tools
+                request_kwargs["tool_choice"] = "auto"
 
             try:
                 response = await self._create_with_backoff(
@@ -408,32 +501,32 @@ class NvidiaNimProvider(AbstractLLMProvider):
                 # Keep ModelExhaustedError's structured fallback state intact.
                 raise
             except Exception as e:
+                if _is_tool_unsupported_error(e) and tools_enabled:
+                    # Model has no function calling: drop the tool request and
+                    # answer this round as a plain completion instead of
+                    # burning all worker attempts on a permanent 400.
+                    print(
+                        f"[ADAPT] '{effective_model}' does not support tool "
+                        "calling; continuing without tools"
+                    )
+                    tools_enabled = False
+                    continue
+                friendly = _friendly_auth_error(e)
+                if friendly is not None:
+                    raise friendly from e
                 raise ProviderError(f"LLM provider request failed: {str(e)}")
 
             if not response.choices:
                 raise ProviderError("LLM response had no choices")
 
             choice = response.choices[0]
-            usage_data = getattr(response, "usage", None)
-            if usage_data:
-                total_prompt += getattr(usage_data, "prompt_tokens", 0) or 0
-                total_comp += getattr(usage_data, "completion_tokens", 0) or 0
-
             message = choice.message
 
             if not getattr(message, "tool_calls", None):
                 textual = message.content or ""
                 if not textual.strip():
                     raise ProviderError("LLM response content was empty")
-                return ProviderResponse(
-                    content=textual,
-                    usage=ProviderUsage(
-                        prompt_tokens=total_prompt,
-                        completion_tokens=total_comp,
-                        total_tokens=total_prompt + total_comp,
-                    ),
-                    finish_reason=choice.finish_reason,
-                )
+                return ProviderResponse(content=textual)
 
             # Echo the assistant's tool-call request into the history so the
             # following role:tool messages can reference it by tool_call_id.

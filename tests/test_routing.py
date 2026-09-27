@@ -77,6 +77,137 @@ def fresh_provider(**kw):
 
 
 # ---------------------------------------------------------------------------
+# 0. Multi-key routing: model_keys maps a model id -> the API key that served
+#    it; calls for that model must go through that key's cached client.
+# ---------------------------------------------------------------------------
+
+def test_multi_key_routing():
+    observed: list[tuple] = []
+
+    class TaggedClient:
+        def __init__(self, api_key=None, **kwargs):
+            self.api_key = api_key
+            outer = self
+
+            class Completions:
+                def create(self, **kw):
+                    observed.append((kw.get("model"), outer.api_key))
+                    return make_resp('{"ok": true}')
+
+            self.chat = type("C", (), {"completions": Completions()})()
+
+    original = bp.openai
+    bp.openai = types.SimpleNamespace(
+        OpenAI=TaggedClient,
+        APITimeoutError=openai.APITimeoutError,
+        APIConnectionError=openai.APIConnectionError,
+        RateLimitError=openai.RateLimitError,
+        APIStatusError=openai.APIStatusError,
+    )
+    try:
+        p = fresh_provider(api_key="default-key")
+        p.model_keys = {"served/by-b": "key-B"}
+
+        async def go():
+            await p.generate("s", "u", schema={}, model="served/by-b")   # mapped
+            await p.generate("s", "u", schema={}, model="other/model")   # default
+            await p.generate("s", "u", schema={}, model="served/by-b")   # cache hit
+        asyncio.run(go())
+
+        assert observed == [
+            ("served/by-b", "key-B"),
+            ("other/model", "default-key"),
+            ("served/by-b", "key-B"),
+        ], observed
+        # one cached client per distinct key, not per call
+        assert len(p._key_clients) == 1
+    finally:
+        bp.openai = original
+    print("PASS  multi-key routing: mapped models use their key's cached client, others the default")
+
+
+# ---------------------------------------------------------------------------
+# 0b. Per-key base URL routing: a key must be sent to ITS provider's endpoint,
+#     not the single env LLM_BASE_URL (that bug made every stored key serve
+#     only the env provider's models).
+# ---------------------------------------------------------------------------
+
+def test_per_key_base_url():
+    # Pure mapping checks (no clients involved).
+    nv = "https://integrate.api.nvidia.com/v1"
+    assert bp.base_url_for_key("gsk_abc", nv) == "https://api.groq.com/openai/v1"
+    assert bp.base_url_for_key("sk-or-abc", nv) == "https://openrouter.ai/api/v1"
+    assert bp.base_url_for_key("sk-ant-abc", nv) == "https://api.anthropic.com/v1"
+    assert bp.base_url_for_key("AIzaabc", nv) == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert bp.base_url_for_key("sk-proj-abc", nv) == "https://api.openai.com/v1"
+    assert bp.base_url_for_key("nvapi-abc", nv) == nv
+    # Ambiguous bare sk- keeps the configured endpoint.
+    assert bp.base_url_for_key("sk-plainlegacy", nv) == nv
+    assert bp.base_url_for_key(None, nv) == nv
+    # Local/dev endpoints are never overridden.
+    assert bp.base_url_for_key("gsk_abc", "http://localhost:11434/v1") == "http://localhost:11434/v1"
+
+    made: list[dict] = []
+
+    class CapturingClient(RecordingClient):
+        def __init__(self, api_key=None, **kwargs):
+            super().__init__()
+            self.api_key = api_key
+            self.base_url = kwargs.get("base_url")
+            made.append({"api_key": api_key, "base_url": self.base_url})
+
+    original = bp.openai
+    bp.openai = types.SimpleNamespace(
+        OpenAI=CapturingClient,
+        APITimeoutError=openai.APITimeoutError,
+        APIConnectionError=openai.APIConnectionError,
+        RateLimitError=openai.RateLimitError,
+        APIStatusError=openai.APIStatusError,
+    )
+    original_env = os.environ.get("LLM_BASE_URL")
+    os.environ["LLM_BASE_URL"] = nv
+    try:
+        # An injected Groq key routes the DEFAULT client (and thus /api/models)
+        # to Groq, not the env NVIDIA URL.
+        p = fresh_provider(api_key="gsk_mainkey")
+        assert made[0] == {"api_key": "gsk_mainkey", "base_url": "https://api.groq.com/openai/v1"}, made
+
+        # model_keys clients each get their own endpoint; unmapped models keep default.
+        made.clear()
+        p2 = fresh_provider(api_key="nvapi_main")
+        assert made[0]["base_url"] == nv
+        p2.model_keys = {"llama-fast": "gsk_g", "router-mix": "sk-or-third"}
+        async def go():
+            await p2.generate("s", "u", schema={}, model="llama-fast")
+            await p2.generate("s", "u", schema={}, model="router-mix")
+            await p2.generate("s", "u", schema={}, model="llama-fast")  # cache hit, no new client
+            await p2.generate("s", "u", schema={}, model="nvidia/ncp")   # default client
+        asyncio.run(go())
+        urls = {m["api_key"]: m["base_url"] for m in made[1:]}
+        assert urls == {"gsk_g": "https://api.groq.com/openai/v1",
+                        "sk-or-third": "https://openrouter.ai/api/v1"}, urls
+        assert len(p2._key_clients) == 2
+        # Correct key actually served each model:
+        assert [(c.models, c.api_key) for c in (p2._key_clients["gsk_g"], p2._key_clients["sk-or-third"], p2.client)] == \
+               [(["llama-fast", "llama-fast"], "gsk_g"), (["router-mix"], "sk-or-third"), (["nvidia/ncp"], "nvapi_main")]
+
+        # Mixed-provider rotation: the rotated-to key's client is rebuilt
+        # pointing at ITS endpoint, not the env one.
+        made.clear()
+        p3 = fresh_provider(api_key="nvapi_a,gsk_b")
+        asyncio.run(p3.generate("s", "u", schema={}))  # rotates to gsk_b
+        assert p3.client.api_key == "gsk_b"
+        assert p3.client.base_url == "https://api.groq.com/openai/v1"
+    finally:
+        bp.openai = original
+        if original_env is None:
+            os.environ.pop("LLM_BASE_URL", None)
+        else:
+            os.environ["LLM_BASE_URL"] = original_env
+    print("PASS  every key talks to its own provider's endpoint (injected, per-model, rotation)")
+
+
+# ---------------------------------------------------------------------------
 # 1. Planner parses model_override
 # ---------------------------------------------------------------------------
 
@@ -254,6 +385,8 @@ def test_orchestrator_wiring():
 
 
 if __name__ == "__main__":
+    test_multi_key_routing()
+    test_per_key_base_url()
     test_planner_parses_model_override()
     test_provider_model_override()
     test_api_key_injection()

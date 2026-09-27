@@ -34,7 +34,7 @@ ws.onmessage = (e) => {
   if (msg.type === 'task_resumed') {
     console.log(`task_resumed: ${msg.data.task_id} after feedback "${msg.data.feedback}"`);
   }
-  if (['execution_completed', 'execution_complete', 'execution_failed', 'error'].includes(msg.type)) {
+  if (['run_completed', 'execution_failed', 'error'].includes(msg.type)) {
     console.log('terminal event:', msg.type);
     console.log('Timed lifecycle sequence:');
     for (const line of timed) console.log('  ' + line);
