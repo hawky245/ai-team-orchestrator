@@ -29,12 +29,26 @@ PLAN = {
 
 
 class Provider:
+    """Fake provider with deterministic hooks: `after_planner` and
+    `after_review(n)` fire inside the run coroutine, so a stop request lands
+    with zero scheduling gap (the old wait_for-then-stop pattern raced the
+    wave boundary and flaked on slow CI runners)."""
+
     def __init__(self):
         self.worker_calls: list[str] = []
+        self.after_planner = None
+        self.review_count = 0
+        self.after_review = None
 
     async def generate(self, system_prompt, user_prompt, schema=None, **kwargs):
         if "Planner Agent" in system_prompt:
-            return ProviderResponse(content=json.dumps(PLAN))
+            resp = ProviderResponse(content=json.dumps(PLAN))
+            if self.after_planner:
+                self.after_planner()
+            return resp
+        self.review_count += 1
+        if self.after_review:
+            self.after_review(self.review_count)
         return ProviderResponse(content=json.dumps(
             {"approved": True, "feedback": "ok"}))
 
@@ -87,9 +101,10 @@ def test_request_stop_halts_run():
         # wave 2 (t3) is still pending when the stop lands.
         frame = await ws.wait_for(lambda f: f["type"] == "task_requires_input")
         assert frame["data"]["task_id"] == "t2"
+        # Stop from inside t2's review call (same coroutine as the pipeline):
+        # wave 3's boundary check cannot pass before the flag is set.
+        prov.after_review = lambda n: n >= 2 and orch.request_stop()
         orch.submit_feedback("t2", "pick vLLM")
-        await ws.wait_for(lambda f: f["type"] == "task_resumed")
-        orch.request_stop()
         result = await asyncio.wait_for(run, timeout=30)
         assert result == {"error": "stopped by user", "status": "stopped"}, result
         failed = ws.has(lambda f: f["type"] == "execution_failed")
@@ -106,11 +121,10 @@ def test_request_stop_halts_run():
 def test_stop_skips_unstarted_tasks():
     async def scenario():
         orch, prov, ws = build()
+        # Stop from inside the planner call: the wave-1 boundary check runs
+        # after it, so no task can start.
+        prov.after_planner = orch.request_stop
         run = asyncio.create_task(orch.run("pre-stop goal", websocket=ws))
-        # Stop the instant the plan exists but before any worker call: the
-        # per-task gate must skip every task.
-        await ws.wait_for(lambda f: f["type"] == "planning_completed")
-        orch.request_stop()
         result = await asyncio.wait_for(run, timeout=30)
         assert result["status"] == "stopped", result
         assert prov.worker_calls == [], prov.worker_calls
