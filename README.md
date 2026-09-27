@@ -54,7 +54,7 @@ WebSocket stream. Pan, zoom, drag nodes; RECENTER rescues a drifted view.
 
 ```mermaid
 flowchart LR
-    UI[React console<br/>WS client] <-->|{"type": …, "data": …}| API[FastAPI<br/>/ws/execute]
+    UI[React console<br/>WS client] <-->|type + data frames| API[FastAPI<br/>/ws/execute]
     API --> O[Orchestrator]
     O --> P[Planner agent<br/>goal → task DAG]
     P --> W{Wave scheduler<br/>topological levels}
