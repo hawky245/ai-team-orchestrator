@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from main import AI_TEAM_ORCHESTRATOR
+from src import telemetry
 from src.database import RunModel, TaskModel, get_db
 from src.providers.base_provider import (
     NvidiaNimProvider,
@@ -86,6 +87,12 @@ async def list_available_models():
     """Server-key catalogue only. Keys must travel in the POST body —
     query-string keys land verbatim in every proxy/access log."""
     return await _models_payload(None)
+
+@app.get("/api/telemetry")
+async def get_telemetry():
+    """Real server metrics for the console's bottom bar (stdlib sampler,
+    no key material involved)."""
+    return telemetry.sample()
 
 @app.post("/api/models")
 async def list_available_models_for_key(payload: ModelsRequest):

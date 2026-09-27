@@ -38,4 +38,19 @@ export class ApiService {
       default_model: typeof data.default_model === 'string' ? data.default_model : undefined
     };
   }
+
+  static async getTelemetry(): Promise<{
+    cpu_percent: number | null;
+    mem_percent: number | null;
+    uptime_s: number;
+  }> {
+    const response = await fetch(`${API_BASE_URL}/api/telemetry`);
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    const data = await response.json();
+    return {
+      cpu_percent: typeof data.cpu_percent === 'number' ? data.cpu_percent : null,
+      mem_percent: typeof data.mem_percent === 'number' ? data.mem_percent : null,
+      uptime_s: typeof data.uptime_s === 'number' ? data.uptime_s : 0
+    };
+  }
 }

@@ -22,6 +22,7 @@ export interface ToolHit {
 export interface TaskNode {
   taskId: string;
   index: number;
+  role?: string;         // planner-chosen label (Researcher/Analyst/...), goal-specific
   description: string;
   dependsOn: string[];
   requiresUserInput: boolean;
@@ -38,6 +39,8 @@ export interface TaskNode {
   inputContext?: Record<string, string>;
   error?: string;
   retryReason?: string;
+  promptTokens?: number;
+  completionTokens?: number;
   startedAt?: number;
   endedAt?: number;
   // ids of dependency nodes that fed this node when it started (wire pulse)
@@ -55,6 +58,7 @@ export type ConsolePhase =
 export interface ReviewTask {
   task_id: string;
   task_index: number;
+  role?: string;
   description: string;
   depends_on: string[];
   planner_model: string;
@@ -70,6 +74,7 @@ export interface ConsoleState {
   reviewTasks: ReviewTask[] | null;
   modelForced: string | null;
   finalOutput: string | null;
+  totalTokens: { prompt: number; completion: number };
   eventCount: number;
   startedAt?: number;
   finishedAt?: number;
@@ -83,6 +88,7 @@ const initial: ConsoleState = {
   reviewTasks: null,
   modelForced: null,
   finalOutput: null,
+  totalTokens: { prompt: 0, completion: 0 },
   eventCount: 0
 };
 
@@ -103,6 +109,25 @@ function withNode(
   return { ...s, nodes: { ...s.nodes, [taskId]: { ...node, ...patch(node) } } };
 }
 
+// Token frames patch the node AND add to the run total in one step.
+function withNodeTokens(
+  s: ConsoleState,
+  taskId: string,
+  d: Record<string, any>,
+  patch: (n: TaskNode) => Partial<TaskNode>
+): ConsoleState {
+  const p = Number(d.prompt_tokens) || 0;
+  const c = Number(d.completion_tokens) || 0;
+  const next = withNode(s, taskId, n => ({
+    promptTokens: (n.promptTokens ?? 0) + p,
+    completionTokens: (n.completionTokens ?? 0) + c,
+    ...patch(n),
+  }));
+  return p || c
+    ? { ...next, totalTokens: { prompt: s.totalTokens.prompt + p, completion: s.totalTokens.completion + c } }
+    : next;
+}
+
 // Pure reducer: one console state per WS frame. Kept side-effect free so the
 // canvas only re-renders the nodes whose data actually changed.
 export function reduceFrame(s: ConsoleState, f: Frame): ConsoleState {
@@ -114,6 +139,7 @@ export function reduceFrame(s: ConsoleState, f: Frame): ConsoleState {
       return {
         ...initial,
         goal: String(d.goal ?? ''),
+        runIdHint: String(d.run_id ?? '') || undefined,
         phase: 'planning',
         startedAt: now(),
         eventCount: base.eventCount
@@ -134,6 +160,7 @@ export function reduceFrame(s: ConsoleState, f: Frame): ConsoleState {
         nodes[t.task_id] = {
           taskId: t.task_id,
           index: t.task_index,
+          role: t.role ? String(t.role) : undefined,
           description: t.description,
           dependsOn: t.depends_on || [],
           requiresUserInput: !!t.requires_user_input,
@@ -214,17 +241,17 @@ export function reduceFrame(s: ConsoleState, f: Frame): ConsoleState {
       }));
 
     case 'task_worker_completed':
-      return withNode(base, String(d.task_id ?? ''), n => ({
+      return withNodeTokens(base, String(d.task_id ?? ''), d, () => ({
         status: 'reviewing',
         output: String(d.output ?? ''),
-        attempts: Number(d.attempts ?? n.attempts) || 1
+        attempts: Number(d.attempts ?? 0) || 1
       }));
 
     case 'task_review_started':
       return withNode(base, String(d.task_id ?? ''), () => ({ status: 'reviewing' }));
 
     case 'task_review_passed':
-      return withNode(base, String(d.task_id ?? ''), n => ({
+      return withNodeTokens(base, String(d.task_id ?? ''), d, () => ({
         status: 'done',
         feedback: String(d.feedback ?? ''),
         endedAt: now(),
@@ -234,7 +261,7 @@ export function reduceFrame(s: ConsoleState, f: Frame): ConsoleState {
     case 'task_review_failed':
       // Ambiguous: may be followed by a retry (back to running) or a final
       // rejection; keep the node in review until the decisive frame lands.
-      return withNode(base, String(d.task_id ?? ''), n => ({
+      return withNodeTokens(base, String(d.task_id ?? ''), d, n => ({
         status: n.status === 'running' ? 'running' : 'reviewing',
         feedback: String(d.feedback ?? d.error ?? '')
       }));
@@ -286,7 +313,7 @@ export function reduceFrame(s: ConsoleState, f: Frame): ConsoleState {
       }));
 
     case 'task_retry_review_passed':
-      return withNode(base, String(d.task_id ?? ''), n => ({
+      return withNodeTokens(base, String(d.task_id ?? ''), d, n => ({
         status: 'done',
         feedback: String(d.feedback ?? ''),
         attempts: Math.max(n.attempts, 2),
@@ -294,21 +321,28 @@ export function reduceFrame(s: ConsoleState, f: Frame): ConsoleState {
       }));
 
     case 'task_retry_review_failed':
-      return withNode(base, String(d.task_id ?? ''), n => ({
+      return withNodeTokens(base, String(d.task_id ?? ''), d, n => ({
         status: 'rejected',
         feedback: String(d.feedback ?? d.error ?? ''),
         attempts: Math.max(n.attempts, 2),
         endedAt: now()
       }));
 
-    case 'run_completed':
+    case 'run_completed': {
+      // Backend total is authoritative; use it instead of the live tally.
+      const tot = (d.summary || {}).total_tokens || {};
       return {
         ...base,
         finalOutput: String(d.final_output ?? ''),
+        totalTokens: {
+          prompt: Number(tot.prompt) || base.totalTokens.prompt,
+          completion: Number(tot.completion) || base.totalTokens.completion
+        },
         phase: String((d.summary || {}).status ?? '') === 'completed' ? 'done' : 'failed',
         finishedAt: now(),
         reviewTasks: null
       };
+    }
 
     case 'execution_failed':
       return { ...base, phase: 'failed', finishedAt: now(), reviewTasks: null };

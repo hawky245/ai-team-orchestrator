@@ -39,10 +39,11 @@ class Provider:
         self.after_planner = None
         self.review_count = 0
         self.after_review = None
+        self.plan = PLAN
 
     async def generate(self, system_prompt, user_prompt, schema=None, **kwargs):
         if "Planner Agent" in system_prompt:
-            resp = ProviderResponse(content=json.dumps(PLAN))
+            resp = ProviderResponse(content=json.dumps(self.plan))
             if self.after_planner:
                 self.after_planner()
             return resp
@@ -132,8 +133,65 @@ def test_stop_skips_unstarted_tasks():
     print("PASS  stopping right after planning skips every task")
 
 
+# ---------------------------------------------------------------------------
+# D. STOP during the plan-review gate cancels the run (was: sat in
+#    AWAITING REVIEW forever, the exact screenshot-2 symptom).
+# ---------------------------------------------------------------------------
+
+def test_stop_during_review_gate():
+    async def scenario():
+        orch, prov, ws = build()
+        run = asyncio.create_task(
+            orch.run("review-stop goal", websocket=ws, review_plan=True)
+        )
+        # Park in the review gate, then STOP while it is waiting.
+        await ws.wait_for(lambda f: f["type"] == "plan_review_requested")
+        orch.request_stop()
+        result = await asyncio.wait_for(run, timeout=30)
+        assert result == {"error": "stopped by user", "status": "stopped"}, result
+        failed = ws.has(lambda f: f["type"] == "execution_failed")
+        assert failed and "plan review" in failed["data"]["error"], failed
+        # No worker ever ran — we never left the review pause.
+        assert prov.worker_calls == [], prov.worker_calls
+    asyncio.run(scenario())
+    print("PASS  STOP during the plan-review gate cancels the run")
+
+
+# ---------------------------------------------------------------------------
+# E. STOP while the LAST task is mid-flight: the run must report stopped,
+#    NOT "RUN COMPLETE" (the exact screenshot-1 symptom).
+# ---------------------------------------------------------------------------
+
+def test_stop_during_last_task_reports_stopped():
+    async def scenario():
+        orch, prov, ws = build()
+        # A 3-task chain (planner minimum) with no pauses: the last task's
+        # review is the final boundary, so only the end-of-run check can stop
+        # it — proving a stopped run never announces RUN COMPLETE.
+        prov.plan = {
+            "summary": "s", "execution_order": "dag",
+            "tasks": [
+                {"task_id": "t1", "description": "a", "depends_on": []},
+                {"task_id": "t2", "description": "b", "depends_on": ["t1"]},
+                {"task_id": "t3", "description": "c", "depends_on": ["t2"]},
+            ],
+        }
+        # Stop from inside the LAST review (n==3).
+        prov.after_review = lambda n: n >= 3 and orch.request_stop()
+        run = asyncio.create_task(orch.run("last-task goal", websocket=ws))
+        result = await asyncio.wait_for(run, timeout=30)
+        assert result.get("status") == "stopped", result
+        assert ws.has(lambda f: f["type"] == "run_completed") is None, \
+            "run_completed must NOT fire on a stopped run"
+        assert ws.has(lambda f: f["type"] == "execution_failed") is not None
+    asyncio.run(scenario())
+    print("PASS  STOP during the last task reports stopped, not RUN COMPLETE")
+
+
 if __name__ == "__main__":
     test_pause_carries_context()
     test_request_stop_halts_run()
     test_stop_skips_unstarted_tasks()
+    test_stop_during_review_gate()
+    test_stop_during_last_task_reports_stopped()
     print("\nAll Milestone 21 stop/context tests passed.")

@@ -57,8 +57,10 @@
   body {
     @apply bg-background text-foreground antialiased;
     background-image:
+      radial-gradient(hsl(184 70% 60% / 0.055) 1px, transparent 1px),
       radial-gradient(ellipse 80% 50% at 50% -10%, hsl(184 100% 50% / 0.06), transparent),
       radial-gradient(ellipse 60% 40% at 85% 110%, hsl(222 60% 30% / 0.15), transparent);
+    background-size: 24px 24px, auto, auto;
     min-height: 100vh;
   }
 
@@ -85,6 +87,33 @@
     @apply rounded-xl border border-border/80 bg-card/80 backdrop-blur-md;
     box-shadow: 0 0 0 1px hsl(184 100% 50% / 0.04), 0 8px 32px rgb(0 0 0 / 0.45);
   }
+
+  /* M23 console rails: cyan-framed panels on the dot-grid field */
+  .rail-panel {
+    @apply rounded-lg border border-cyan-400/25 bg-[hsl(222_30%_7%/0.92)] backdrop-blur-md;
+    box-shadow: 0 6px 24px rgb(0 0 0 / 0.5), inset 0 0 30px hsl(184 100% 50% / 0.03);
+  }
+  .rail-title {
+    @apply px-3 pb-1.5 pt-2.5 font-mono text-[10px] font-bold uppercase tracking-[0.24em] text-cyan-300;
+  }
+  .rail-row {
+    @apply flex items-baseline gap-1.5 font-mono text-[11px] leading-relaxed;
+  }
+
+  /* Bracket frame used by the telemetry bar ends */
+  .bracket-frame { position: relative; }
+  .bracket-frame::before,
+  .bracket-frame::after {
+    content: '';
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    width: 10px;
+    border: 1px solid hsl(184 100% 50% / 0.45);
+    pointer-events: none;
+  }
+  .bracket-frame::before { left: 6px; border-right: 0; }
+  .bracket-frame::after { right: 6px; border-left: 0; }
 
   .hud-label {
     @apply text-2xs font-semibold uppercase tracking-[0.18em] text-muted-foreground;

@@ -15,16 +15,16 @@ export function SignalEdge(props: EdgeProps) {
     sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition
   });
 
-  const color = d.dead ? 'hsl(342 100% 60%)' : d.flowing ? 'hsl(184 100% 55%)' : 'hsl(215 18% 42%)';
+  const color = d.dead ? 'hsl(342 100% 60%)' : d.flowing ? 'hsl(184 100% 55%)' : 'hsl(184 60% 50% / 0.4)';
 
   return (
     <>
-      {d.flowing && (
+      {(d.flowing || d.dead) && (
         <path
           id={`${id}-glow`}
           d={path}
           fill="none"
-          stroke="hsl(184 100% 55% / 0.35)"
+          stroke={d.dead ? 'hsl(342 100% 60% / 0.35)' : 'hsl(184 100% 55% / 0.35)'}
           strokeWidth={5}
           style={{ filter: 'blur(3px)' }}
         />
@@ -35,8 +35,9 @@ export function SignalEdge(props: EdgeProps) {
         fill="none"
         stroke={color}
         strokeWidth={d.flowing ? 1.8 : 1.2}
-        strokeOpacity={d.flowing ? 1 : 0.65}
+        strokeOpacity={d.flowing ? 1 : 0.8}
         className={d.flowing ? 'wire-flow' : 'wire-idle'}
+        style={d.flowing || d.dead ? undefined : { filter: 'drop-shadow(0 0 2px hsl(184 100% 50% / 0.35))' }}
       />
     </>
   );

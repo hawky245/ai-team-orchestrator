@@ -20,8 +20,16 @@ class ProviderConfig(BaseModel):
 
 
 class ProviderResponse(BaseModel):
-    """Normalized response from the provider."""
+    """Normalized response from the provider.
+
+    Token counts feed the dashboard's per-task and per-run meters — the
+    audit cut them once for having no consumers; M22 earned them back.
+    In the tool loop they accumulate across ALL rounds, so the number
+    reflects what the task actually cost.
+    """
     content: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class ProviderError(Exception):
@@ -435,7 +443,12 @@ class NvidiaNimProvider:
             if not textual.strip():
                 raise ProviderError("LLM response content was empty")
 
-            return ProviderResponse(content=textual)
+            usage = getattr(response, "usage", None)
+            return ProviderResponse(
+                content=textual,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0 if usage else 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) or 0 if usage else 0,
+            )
 
         except ProviderError:
             # Re‑raise ProviderError as‑is (no prefix wrapping)
@@ -481,6 +494,10 @@ class NvidiaNimProvider:
         # Flipped off when the model 400s on function calling; the per-round
         # kwargs are rebuilt, so a one-shot pop would be undone.
         tools_enabled = bool(tools)
+        # Token meter accumulates across every round of the loop, so the
+        # per-task figure reflects the true cost of the tool conversation.
+        tok_prompt = 0
+        tok_comp = 0
 
         for round_no in range(self.MAX_TOOL_ROUNDS + 1):
             request_kwargs = {
@@ -520,13 +537,21 @@ class NvidiaNimProvider:
                 raise ProviderError("LLM response had no choices")
 
             choice = response.choices[0]
+            usage = getattr(response, "usage", None)
+            if usage:
+                tok_prompt += getattr(usage, "prompt_tokens", 0) or 0
+                tok_comp += getattr(usage, "completion_tokens", 0) or 0
             message = choice.message
 
             if not getattr(message, "tool_calls", None):
                 textual = message.content or ""
                 if not textual.strip():
                     raise ProviderError("LLM response content was empty")
-                return ProviderResponse(content=textual)
+                return ProviderResponse(
+                    content=textual,
+                    prompt_tokens=tok_prompt,
+                    completion_tokens=tok_comp,
+                )
 
             # Echo the assistant's tool-call request into the history so the
             # following role:tool messages can reference it by tool_call_id.

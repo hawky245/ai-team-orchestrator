@@ -89,6 +89,9 @@ Rules:
         print("==========================\n")
 
         worker_result = self._parse_result(response.content)
+        # Carry the provider-reported cost up to the orchestrator's meters.
+        worker_result.prompt_tokens = response.prompt_tokens
+        worker_result.completion_tokens = response.completion_tokens
         return worker_result
 
     def _parse_result(self, raw_text: str) -> WorkerResult:

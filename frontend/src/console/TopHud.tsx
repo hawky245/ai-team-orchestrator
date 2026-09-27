@@ -1,6 +1,6 @@
-import { useMemo, useState } from 'react';
-import { Zap, Radio, Play, X, RotateCw } from 'lucide-react';
+import { Zap, Radio, Play, X, Coins } from 'lucide-react';
 import TextType from '@/components/reactbits/TextType';
+import { fmtTokens } from '@/console/TaskCanvasNode';
 import type { ConsolePhase } from '@/console/useOrchestration';
 
 export interface TopHudProps {
@@ -15,6 +15,7 @@ export interface TopHudProps {
   onStop: () => void;        // abandon the live run at the next boundary
   isConnected: boolean;
   phase: ConsolePhase;
+  tokens: { prompt: number; completion: number };
   reviewReady: boolean;      // plan_review_requested received
   onStartReview: () => void; // send assignments and resume
   assignedCount: number;
@@ -152,185 +153,16 @@ export function TopHud(props: TopHudProps) {
             <X className="h-4 w-4" /> STOP
           </button>
         )}
+        {props.tokens.prompt + props.tokens.completion > 0 && (
+          <span
+            className="flex h-10 items-center gap-1.5 rounded-lg border border-violet-400/30 bg-violet-400/5 px-3 font-mono text-[11px] text-violet-300"
+            title={`${props.tokens.prompt} prompt / ${props.tokens.completion} completion tokens this run`}
+          >
+            <Coins className="h-3.5 w-3.5" />
+            {fmtTokens(props.tokens.prompt + props.tokens.completion)} TOK
+          </span>
+        )}
       </div>
     </header>
-  );
-}
-
-/* Slide-in Model Bay drawer: hidden by default, opens from a floating HUD
-   tab. Chips are tagged with the serving API provider (from /api/models),
-   carry a refresh button, and never display key material. */
-export function ModelBay({ models, providerBadge, providerTag, modelTags, loading, bayError, onRefresh }: {
-  models: string[];
-  providerBadge: string | null;
-  providerTag: string | null;
-  modelTags?: Record<string, string>;
-  loading: boolean;
-  bayError: string | null;
-  onRefresh: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const [orgFilter, setOrgFilter] = useState('all');
-
-  const parsed = useMemo(
-    () =>
-      models.map(m => {
-        const i = m.indexOf('/');
-        return i > 0 ? { id: m, org: m.slice(0, i), name: m.slice(i + 1) } : { id: m, org: 'other', name: m };
-      }),
-    [models]
-  );
-  const orgs = useMemo(() => Array.from(new Set(parsed.map(p => p.org))).sort(), [parsed]);
-  const q = query.trim().toLowerCase();
-  const visible = parsed.filter(
-    p =>
-      (orgFilter === 'all' || p.org === orgFilter) &&
-      (!q || p.id.toLowerCase().includes(q))
-  );
-
-  const resetFilters = () => {
-    setQuery('');
-    setOrgFilter('all');
-  };
-
-  return (
-    <>
-      {/* Floating HUD tab, pinned to the left edge; slides along with drawer */}
-      <button
-        onClick={() => setOpen(o => !o)}
-        aria-label="Toggle model bay"
-        className={`fixed left-0 top-1/3 z-[45] rounded-r-lg border border-l-0 border-cyan-400/40 bg-cyan-950/80 px-2 py-3 text-[10px] font-bold tracking-[0.2em] text-cyan-200 backdrop-blur-md transition-transform duration-300 ease-in-out hover:bg-cyan-900/60 ${
-          open ? 'translate-x-72' : 'translate-x-0'
-        }`}
-      >
-        {open ? '◂' : '▸'} BAY · {models.length}
-      </button>
-
-      <aside
-        aria-hidden={!open}
-        className={`fixed top-0 left-0 z-[45] flex h-full w-72 flex-col border-r border-cyan-800/50 bg-[hsl(223_33%_5%)]/95 backdrop-blur-md transition-transform duration-300 ease-in-out ${
-          open ? 'translate-x-0' : '-translate-x-full'
-        }`}
-      >
-        <div className="flex items-center justify-between gap-2 border-b border-cyan-900/40 px-3 py-3">
-          <p className="hud-label min-w-0 truncate">
-            Model Bay <span className="text-cyan-300">·</span> {models.length}
-            {visible.length !== models.length && (
-              <span className="ml-1 text-amber-300/90">→ {visible.length}</span>
-            )}
-          </p>
-          <div className="flex shrink-0 items-center gap-1">
-            <button
-              onClick={onRefresh}
-              disabled={loading}
-              aria-label="Refresh model list"
-              title="Re-fetch models for the current key"
-              className="rounded p-1 text-cyan-300 hover:bg-cyan-900/40 disabled:opacity-50"
-            >
-              <RotateCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-            </button>
-            <button
-              onClick={() => setOpen(false)}
-              aria-label="Close model bay"
-              className="rounded p-1 text-muted-foreground hover:bg-cyan-900/40 hover:text-cyan-100"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        {providerBadge && (
-          <div className="flex flex-wrap items-center gap-2 px-3 pt-2.5">
-            <span className="inline-block rounded-sm border border-cyan-700/50 bg-cyan-950/90 px-2 py-1 font-mono text-xs uppercase tracking-wider text-cyan-400">
-              {providerBadge}
-            </span>
-          </div>
-        )}
-        {bayError && (
-          <div className="px-3 pt-2">
-            <span className="inline-block rounded-sm border border-rose-500/60 bg-rose-950/60 px-2 py-1 font-mono text-xs uppercase tracking-wider text-rose-300">
-              {bayError}
-            </span>
-          </div>
-        )}
-
-        <div className="space-y-2 border-b border-cyan-900/40 px-3 py-2">
-          <input
-            value={query}
-            onChange={e => setQuery(e.target.value)}
-            placeholder="Search models…"
-            className="h-8 w-full rounded-md border border-input bg-secondary/60 px-2 text-xs text-foreground placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-          />
-          <div className="flex gap-1.5">
-            <select
-              value={orgFilter}
-              onChange={e => setOrgFilter(e.target.value)}
-              className="h-8 min-w-0 flex-1 rounded-md border border-input bg-secondary/60 px-1.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            >
-              <option value="all">All orgs ({orgs.length})</option>
-              {orgs.map(o => (
-                <option key={o} value={o}>{o}</option>
-              ))}
-            </select>
-            {(query || orgFilter !== 'all') && (
-              <button
-                onClick={resetFilters}
-                className="h-8 shrink-0 rounded-md border border-cyan-400/30 px-2 text-[10px] font-bold tracking-wide text-cyan-200 hover:bg-cyan-900/40"
-              >
-                RESET
-              </button>
-            )}
-          </div>
-        </div>
-
-        <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-3">
-          {models.length === 0 && !bayError && (
-            <p className="text-[11px] leading-relaxed text-muted-foreground">
-              No models loaded. Enter a key (optional) and press ↻ or FETCH,
-              then drag a model onto a task slot.
-            </p>
-          )}
-          {models.length > 0 && visible.length === 0 && (
-            <p className="text-[11px] text-muted-foreground">
-              No models match the current filters.
-            </p>
-          )}
-          {visible.map(({ id, name }) => (
-            <div
-              key={id}
-              draggable
-              onDragStart={e => {
-                e.dataTransfer.setData('text/plain', id);
-                e.dataTransfer.effectAllowed = 'copy';
-                // Slide the drawer out of the way mid-drag: it is fixed and
-                // z-[45], so left open it covers the leftmost task slots and
-                // swallows the drop before it ever reaches them.
-                setOpen(false);
-              }}
-              onDragEnd={() => {
-                // It was the drag that auto-retracted the bay, so the drag
-                // (drop OR cancel) brings it back. Manual closes stay closed
-                // — nothing else ever sets open=false while a chip is held.
-                setOpen(true);
-              }}
-              title={id}
-              className="cursor-grab rounded-md border border-cyan-400/25 bg-cyan-400/5 px-2 py-1.5 hover:bg-cyan-900/30 active:cursor-grabbing"
-            >
-              <span className="mb-1 block font-mono text-sm text-cyan-100 truncate">{name}</span>
-              {/* Badge = the API account/key that will serve this model
-                  (per-chip in merged multi-key bays; never key material). */}
-              <span className="inline-block rounded-sm border border-cyan-700/50 bg-cyan-950/90 px-1.5 py-0.5 font-mono text-[10px] uppercase text-cyan-400">
-                {modelTags?.[id] ?? providerTag ?? 'API'} · {id.includes('/') ? id.slice(0, id.indexOf('/')) : id}
-              </span>
-            </div>
-          ))}
-        </div>
-
-        <p className="border-t border-cyan-900/40 px-3 py-2 text-[9px] leading-snug text-muted-foreground">
-          Drag onto a slot (pre-flight) or a task node (review mode).
-        </p>
-      </aside>
-    </>
   );
 }

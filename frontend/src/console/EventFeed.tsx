@@ -1,6 +1,10 @@
-import { memo, useEffect, useRef, useState } from 'react';
-import { ChevronUp, ChevronDown } from 'lucide-react';
+import { memo, useEffect, useRef } from 'react';
 import type { ConsoleState, EventLine } from '@/console/useOrchestration';
+import { fmtTokens } from '@/console/TaskCanvasNode';
+import { fmtDuration } from '@/console/StatusRail';
+
+const tokSum = (d: Record<string, any>) =>
+  (Number(d.prompt_tokens) || 0) + (Number(d.completion_tokens) || 0);
 
 function describe(e: EventLine): { cls: string; text: string } {
   const d = e.data;
@@ -8,8 +12,8 @@ function describe(e: EventLine): { cls: string; text: string } {
   switch (e.type) {
     case 'task_started': return { cls: 'text-cyan-300', text: `[${String(d.task_id).toUpperCase()}] START ${d.description ?? ''}` };
     case 'tool_execution': return { cls: 'text-amber-300', text: `[${String(d.task_id).toUpperCase()}] TOOL ${d.tool_name} ${JSON.stringify(d.arguments ?? {}).slice(0, 70)}` };
-    case 'task_worker_completed': return { cls: 'text-sky-300', text: `[${String(d.task_id).toUpperCase()}] OUTPUT (${(d.output ?? '').length} ch)` };
-    case 'task_review_passed': return { cls: 'text-emerald-300', text: `[${String(d.task_id).toUpperCase()}] REVIEW PASS` };
+    case 'task_worker_completed': return { cls: 'text-sky-300', text: `[${String(d.task_id).toUpperCase()}] OUTPUT (${(d.output ?? '').length} ch, ${fmtTokens(tokSum(d))} tok)` };
+    case 'task_review_passed': return { cls: 'text-emerald-300', text: `[${String(d.task_id).toUpperCase()}] REVIEW PASS (${fmtTokens(tokSum(d))} tok)` };
     case 'task_review_failed': return { cls: 'text-rose-300', text: `[${String(d.task_id).toUpperCase()}] REVIEW FAIL: ${(d.feedback ?? d.error ?? '').slice(0, 80)}` };
     case 'task_retry': return { cls: 'text-rose-300', text: `[${String(d.task_id).toUpperCase()}] RETRY #${d.attempt}: ${(d.reason ?? '').slice(0, 70)}` };
     case 'task_requires_input': return { cls: 'text-amber-300', text: `[${String(d.task_id).toUpperCase()}] AWAITING INPUT` };
@@ -22,7 +26,11 @@ function describe(e: EventLine): { cls: string; text: string } {
     case 'plan_models_applied': return { cls: 'text-cyan-200', text: `PRE-ASSIGN: ${d.assigned} slot(s) set` };
     case 'plan_review_requested': return { cls: 'text-amber-300', text: `REVIEW: plan awaiting assignment` };
     case 'plan_review_completed': return { cls: 'text-emerald-300', text: `REVIEW: execution started (${d.assigned} assigned)` };
-    case 'run_completed': return { cls: 'text-emerald-300', text: `RUN COMPLETE — FINAL OUTPUT READY` };
+    case 'run_completed': {
+      const tot = (d.summary || {}).total_tokens || {};
+      const sum = (tot.prompt || 0) + (tot.completion || 0);
+      return { cls: 'text-emerald-300', text: `RUN COMPLETE — FINAL OUTPUT READY${sum ? ` · ${fmtTokens(sum)} tokens` : ''}` };
+    }
     case 'execution_failed': case 'planning_failed': return { cls: 'text-rose-400', text: `${e.type.toUpperCase()}: ${(d.error ?? '').slice(0, 90)}` };
     default: return { cls: 'text-muted-foreground', text: e.type };
   }
@@ -56,7 +64,6 @@ export function EventFeed({
   isConnected: boolean;
   elapsedMs: number;
 }) {
-  const [open, setOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const nodes = Object.values(state.nodes);
@@ -65,37 +72,28 @@ export function EventFeed({
   const running = nodes.filter(n => n.status === 'running' || n.status === 'reviewing').length;
 
   useEffect(() => {
-    if (open && scrollRef.current) {
+    if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [log.length, open]);
+  }, [log.length]);
 
+  // Docked left-rail panel (M23): always visible, auto-scrolling event log.
   return (
-    <footer className="hud-panel absolute inset-x-3 bottom-3 z-40">
-      <button
-        onClick={() => setOpen(o => !o)}
-        className="flex w-full items-center gap-4 px-4 py-2 text-left"
-      >
-        <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-rose-500'}`} />
-        <span className="hud-label">{isConnected ? 'SOCKET LINKED' : 'SOCKET DOWN'}</span>
-        <span className="font-mono text-[11px] text-muted-foreground">
-          {state.eventCount} events
-        </span>
-        <span className="font-mono text-[11px] text-cyan-300">{running} active</span>
-        <span className="font-mono text-[11px] text-emerald-300">{done} passed</span>
-        <span className="font-mono text-[11px] text-rose-300">{failed} failed</span>
-        <span className="ml-auto font-mono text-[11px] text-muted-foreground">
-          {(elapsedMs / 1000).toFixed(1)}s
-        </span>
-        {open
-          ? <ChevronDown className="h-4 w-4 text-muted-foreground" />
-          : <ChevronUp className="h-4 w-4 text-muted-foreground" />}
-      </button>
-      {open && (
-        <div ref={scrollRef} className="max-h-56 overflow-y-auto border-t border-border/60 px-4 py-2">
-          <LogRows log={log} />
-        </div>
-      )}
-    </footer>
+    <section className="rail-panel flex min-h-[260px] flex-1 flex-col">
+      <div className="flex items-center gap-2">
+        <h2 className="rail-title flex-1">Event Log</h2>
+        <span className={`mr-3 h-1.5 w-1.5 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-rose-500'}`} />
+      </div>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 pb-2">
+        <LogRows log={log} />
+      </div>
+      <div className="flex gap-3 border-t border-cyan-400/15 px-3 py-1.5 font-mono text-[9px] uppercase tracking-wider">
+        <span className="text-muted-foreground">{state.eventCount} ev</span>
+        <span className="text-cyan-300">{running} act</span>
+        <span className="text-emerald-300">{done} pass</span>
+        <span className="text-rose-300">{failed} fail</span>
+        <span className="ml-auto text-muted-foreground">{fmtDuration(elapsedMs)}</span>
+      </div>
+    </section>
   );
 }

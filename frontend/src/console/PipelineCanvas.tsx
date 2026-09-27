@@ -56,6 +56,12 @@ function buildTaskNode(
     type: 'task',
     position: draggedPos ?? { x: 40 + p.level * 310, y: 40 + p.row * 200 },
     data: data as unknown as Record<string, unknown>,
+    // Seed dimensions so xyflow never treats the node as "unmeasured" and
+    // flips it to visibility:hidden while the per-frame rebuild thrashes its
+    // internal `measured` value mid-run (the "task boxes disappear" bug).
+    // Real measured dims take precedence the moment they're available.
+    initialWidth: 250,
+    initialHeight: 130,
     selected: props.selectedTaskId === p.taskId
   };
 }
@@ -156,18 +162,26 @@ function PipelineCanvasImpl(props: PipelineCanvasProps) {
   }, [state, models, reviewMode, props.slotModels, props.selectedTaskId, props.assignmentOverride, dragTick]);
 
   // Re-fit whenever the graph structure changes (plan spawns, slots appear).
-  // Delay past the commit so ReactFlow has measured the new node bounds, and
-  // never fit against a zero-sized container — that bakes in a degenerate
-  // transform which leaves the nodes invisible until the next resize.
+  // fitView is a SILENT NO-OP while nodes are still unmeasured — custom card
+  // sizes settle a frame or two after mount, so a single delayed call can
+  // leave the stale viewport from the previous run in place and spawn the
+  // new nodes off-screen ("task boxes disappeared"). Retry until every node
+  // reports real dimensions.
   useEffect(() => {
+    let cancelled = false;
+    let tries = 0;
     const fit = () => {
+      if (cancelled) return;
       const el = wrapRef.current;
-      if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
-      rfRef.current?.fitView({ padding: 0.22, maxZoom: 1 });
+      const inst = rfRef.current;
+      if (!el || !inst || el.clientWidth === 0 || el.clientHeight === 0) return;
+      inst.fitView({ padding: 0.22, maxZoom: 1 });
+      const unmeasured = inst.getNodes().some(n => !(n.measured?.width && n.measured?.height));
+      if (unmeasured && tries++ < 15) window.setTimeout(fit, 150);
     };
     const t1 = window.setTimeout(fit, 60);
     const t2 = window.setTimeout(fit, 260);
-    return () => { clearTimeout(t1); clearTimeout(t2); };
+    return () => { cancelled = true; clearTimeout(t1); clearTimeout(t2); };
   }, [nodes.length, state.phase]);
 
   return (

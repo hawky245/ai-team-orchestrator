@@ -4,7 +4,10 @@ import { ApiService } from '@/services/api';
 import { useToast } from '@/hooks/use-toast';
 import { useOrchestration } from '@/console/useOrchestration';
 import { PipelineCanvas } from '@/console/PipelineCanvas';
-import { TopHud, ModelBay } from '@/console/TopHud';
+import { TopHud } from '@/console/TopHud';
+import { Wordmark, StatusPanel, NotesPanel } from '@/console/StatusRail';
+import { ModelsPanel, ProviderStatusPanel, NetworkPanel } from '@/console/ModelsPanel';
+import { TelemetryBar } from '@/console/TelemetryBar';
 import { KeyRing, loadRing, displayTag, detectProvider, RING_LS, type StoredKey } from '@/console/KeyRing';
 import { EventFeed } from '@/console/EventFeed';
 import { InspectorDrawer } from '@/console/InspectorDrawer';
@@ -29,7 +32,6 @@ export default function App() {
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem(API_KEY_LS) ?? '');
   const [models, setModels] = useState<string[]>([]);
   const [modelProvider, setModelProvider] = useState<string | null>(null);
-  const [providerIsCustom, setProviderIsCustom] = useState(false);
   const [bayError, setBayError] = useState<string | null>(null);
   const [loadingModels, setLoadingModels] = useState(false);
   const [selectedModel, setSelectedModel] = useState('auto');
@@ -114,7 +116,6 @@ export default function App() {
   const clearBay = useCallback(() => {
     setModels([]);
     setModelProvider(null);
-    setProviderIsCustom(false);
     setModelKeyMap({});
     setModelTags({});
     fetchedKeyRef.current = null;
@@ -177,7 +178,6 @@ export default function App() {
     setModelKeyMap(nextKeyMap);
     setModelTags(nextTags);
     setModelProvider(okCount === 1 ? (Object.values(nextTags)[0] ?? null) : `${okCount} KEYS`);
-    setProviderIsCustom(jobs.some(j => j.key !== ''));
     setBayError(null);
     fetchedKeyRef.current = active;
     // If no stored key can serve the server's planner model, the run will
@@ -306,13 +306,6 @@ export default function App() {
   };
 
   const selectedNode = selectedTaskId ? state.nodes[selectedTaskId] : null;
-  // Header badge: single key -> "PROVIDER: <label or detected name>";
-  // merged multi-key bay -> "PROVIDER: n KEYS"; server .env -> SOURCE label.
-  const providerBadge = models.length === 0 || !modelProvider
-    ? null
-    : providerIsCustom
-      ? `PROVIDER: ${modelProvider}`
-      : 'SOURCE: LOCAL / DEFAULT';
   const elapsedMs = state.startedAt
     ? (state.finishedAt ?? Date.now()) - state.startedAt
     : 0;
@@ -322,60 +315,81 @@ export default function App() {
     <div className="relative flex h-screen flex-col overflow-hidden">
       <div className="crt-film" aria-hidden="true" />
 
-      <TopHud
-        goal={goal}
-        setGoal={setGoal}
-        models={models}
-        selectedModel={selectedModel}
-        setSelectedModel={setSelectedModel}
-        reviewPlan={reviewPlan}
-        setReviewPlan={handleReviewPlanToggle}
-        onSubmit={handleSubmit}
-        onStop={sendStop}
-        isConnected={isConnected}
-        phase={state.phase}
-        reviewReady={state.phase === 'awaiting-review'}
-        onStartReview={handleStartReview}
-        assignedCount={assignedCount}
-      />
+      <div className="flex min-h-0 flex-1 gap-3 p-3 pb-0">
+        {/* Left rail: identity, live status, event log, notes */}
+        <aside className="flex w-[280px] shrink-0 flex-col gap-3 min-h-0 overflow-y-auto pr-0.5">
+          <Wordmark />
+          <StatusPanel state={state} elapsedMs={elapsedMs} />
+          <EventFeed log={log} state={state} isConnected={isConnected} elapsedMs={elapsedMs} />
+          <NotesPanel state={state} />
+        </aside>
 
-      <main className="flex min-h-0 flex-1 flex-row">
-        <ModelBay
-          models={models}
-          providerBadge={providerBadge}
-          providerTag={modelProvider}
-          modelTags={modelTags}
-          loading={loadingModels}
-          bayError={bayError}
-          onRefresh={() => fetchModels(false)}
-        />
-        <KeyRing
-          keys={ring}
-          activeKey={apiKey}
-          loading={loadingModels}
-          onAddKey={handleAddRingKey}
-          onUseKey={handleUseRingKey}
-          onRemoveKey={handleRemoveRingEntry}
-        />
-        <div className="relative min-h-0 min-w-0 flex-1 overflow-auto">
-          <PipelineCanvas
-            state={state}
+        {/* Center: HUD controls + DAG canvas */}
+        <section className="flex min-w-0 flex-1 flex-col gap-3">
+          <TopHud
+            goal={goal}
+            setGoal={setGoal}
             models={models}
-            slotModels={slotModels}
-            assignmentOverride={state.phase === 'awaiting-review' ? planAssignments : undefined}
-            onAssignTask={handleAssignTask}
-            onAssignSlot={handleAssignSlot}
-            onClearSlots={handleClearSlots}
-            onFeedback={handleFeedbackSubmit}
-            onInspect={setSelectedTaskId}
-            onPaneClick={() => setSelectedTaskId(null)}
-            selectedTaskId={selectedTaskId}
+            selectedModel={selectedModel}
+            setSelectedModel={setSelectedModel}
+            reviewPlan={reviewPlan}
+            setReviewPlan={handleReviewPlanToggle}
+            onSubmit={handleSubmit}
+            onStop={sendStop}
+            isConnected={isConnected}
+            phase={state.phase}
+            tokens={state.totalTokens}
+            reviewReady={state.phase === 'awaiting-review'}
+            onStartReview={handleStartReview}
+            assignedCount={assignedCount}
           />
-          <InspectorDrawer node={selectedNode ?? null} onClose={() => setSelectedTaskId(null)} />
-        </div>
-      </main>
+          <div className="rail-panel relative min-h-0 flex-1 overflow-hidden">
+            <PipelineCanvas
+              state={state}
+              models={models}
+              slotModels={slotModels}
+              assignmentOverride={state.phase === 'awaiting-review' ? planAssignments : undefined}
+              onAssignTask={handleAssignTask}
+              onAssignSlot={handleAssignSlot}
+              onClearSlots={handleClearSlots}
+              onFeedback={handleFeedbackSubmit}
+              onInspect={setSelectedTaskId}
+              onPaneClick={() => setSelectedTaskId(null)}
+              selectedTaskId={selectedTaskId}
+            />
+            <InspectorDrawer node={selectedNode ?? null} onClose={() => setSelectedTaskId(null)} />
+          </div>
+        </section>
 
-      <EventFeed log={log} state={state} isConnected={isConnected} elapsedMs={elapsedMs} />
+        {/* Right rail: model catalogue, provider + network state */}
+        <aside className="flex w-[290px] shrink-0 flex-col gap-3 min-h-0">
+          <ModelsPanel
+            models={models}
+            modelTags={modelTags}
+            providerTag={modelProvider}
+            loading={loadingModels}
+            bayError={bayError}
+            onRefresh={() => fetchModels(false)}
+          />
+          <ProviderStatusPanel modelTags={modelTags} bayError={bayError} />
+          <NetworkPanel
+            isConnected={isConnected}
+            modelCount={models.length}
+            eventCount={state.eventCount}
+          />
+        </aside>
+      </div>
+
+      <TelemetryBar state={state} />
+
+      <KeyRing
+        keys={ring}
+        activeKey={apiKey}
+        loading={loadingModels}
+        onAddKey={handleAddRingKey}
+        onUseKey={handleUseRingKey}
+        onRemoveKey={handleRemoveRingEntry}
+      />
 
       <FinalModal
         output={state.finalOutput ?? ''}

@@ -1,7 +1,8 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { X, Clock3, RotateCcw, Wrench, Cpu, MessageSquareText } from 'lucide-react';
+import { X, Clock3, RotateCcw, Wrench, Cpu, MessageSquareText, Zap } from 'lucide-react';
 import SpotlightCard from '@/components/reactbits/SpotlightCard';
 import TextType from '@/components/reactbits/TextType';
+import { fmtTokens } from '@/console/TaskCanvasNode';
 import type { TaskNode } from '@/console/useOrchestration';
 
 const STATUS_STYLES: Record<string, string> = {
@@ -44,7 +45,7 @@ export function InspectorDrawer({
             <div className="flex h-full flex-col p-4">
               <div className="flex items-start justify-between gap-2">
                 <div>
-                  <p className="font-mono text-[11px] text-cyan-300">{node.taskId} · <span className={STATUS_STYLES[node.status]}>{node.status.toUpperCase()}</span></p>
+                  <p className="font-mono text-[11px] text-cyan-300">{node.role ? node.role.toUpperCase() : node.taskId.toUpperCase()} · <span className={STATUS_STYLES[node.status]}>{node.status.toUpperCase()}</span></p>
                   <p className="mt-1 text-[13px] leading-snug text-foreground">{node.description}</p>
                 </div>
                 <button onClick={onClose} className="rounded p-1 text-muted-foreground hover:text-foreground">
@@ -72,6 +73,11 @@ export function InspectorDrawer({
                   icon={<Cpu className="h-3.5 w-3.5" />}
                   label="Model"
                   value={node.activeModel === 'auto' ? 'planner' : node.activeModel.replace(/^.*\//, '')}
+                />
+                <Metric
+                  icon={<Zap className="h-3.5 w-3.5" />}
+                  label="Tokens (in / out)"
+                  value={`${fmtTokens(node.promptTokens ?? 0)} / ${fmtTokens(node.completionTokens ?? 0)}`}
                 />
               </div>
 

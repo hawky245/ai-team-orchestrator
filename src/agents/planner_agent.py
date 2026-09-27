@@ -22,6 +22,10 @@ PLANNER_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
+                    "role": {
+                        "type": "string",
+                        "description": "Short human label for this step's role.",
+                    },
                     "description": {"type": "string"},
                     "depends_on": {
                         "type": "array",
@@ -55,15 +59,22 @@ You MUST respond with ONLY a single JSON object that matches this exact schema (
 {
   "summary": "Brief summary of the overall plan",
   "tasks": [
-    {"task_id": "t1", "description": "Specific, actionable task description", "depends_on": [], "context": {}},
-    {"task_id": "t2", "description": "Independent task, needs no other output", "depends_on": [], "context": {}},
-    {"task_id": "t3", "description": "Task that combines t1 and t2", "depends_on": ["t1", "t2"], "context": {}}
+    {"task_id": "t1", "role": "Researcher", "description": "Specific, actionable task description", "depends_on": [], "context": {}},
+    {"task_id": "t2", "role": "Analyst", "description": "Independent task, needs no other output", "depends_on": [], "context": {}},
+    {"task_id": "t3", "role": "Writer", "description": "Task that combines t1 and t2", "depends_on": ["t1", "t2"], "context": {}},
+    {"task_id": "t4", "role": "Reviewer", "description": "Checks t3's draft for accuracy", "depends_on": ["t3"], "context": {}}
   ],
   "execution_order": "dag"
 }
 
 RULES:
 - Generate EXACTLY 3 to 7 tasks (not less, not more).
+- Give every task a "role": ONE short word (max ~20 chars, Title Case) naming
+  what that step contributes to THIS goal — e.g. "Researcher", "Analyst",
+  "Planner", "Writer", "Editor", "Critic", "Summarizer", "Fact-Checker",
+  "Architect". Derive it from the task's actual purpose; do NOT reuse the same
+  role for every task, and do NOT invent fixed pipeline names that don't fit
+  the goal. This label is shown as the node title on the user's dashboard.
 - Tasks should be concrete and specific (not vague).
 - "depends_on" lists the task IDs whose output this task needs before it can start.
 - The orchestrator runs tasks CONCURRENTLY whenever their depends_on allow it:
@@ -166,6 +177,14 @@ RULES:
             if not description:
                 raise ValueError(f"Task {idx} has empty description")
 
+            # Role is planner-chosen and goal-specific; keep it short and
+            # clean, fall back to a generic label the UI can still show.
+            role = t.get("role")
+            if not isinstance(role, str) or not role.strip():
+                role = None
+            else:
+                role = role.strip()[:24]
+
             # Accept both spellings of the dependency list: the new
             # `depends_on` (Milestone 8 spec) and legacy `dependencies`.
             raw_deps = []
@@ -194,6 +213,7 @@ RULES:
                 Task(
                     task_id=task_id,
                     description=description,
+                    role=role,
                     dependencies=raw_deps,
                     requires_user_input=requires_user_input,
                     model_override=model_override,

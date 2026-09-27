@@ -226,6 +226,27 @@ class AI_TEAM_ORCHESTRATOR:
         self.provider.model_keys = dict(model_keys or {})
         self._stop_event.clear()
 
+        async def _race_stop(target: asyncio.Event, timeout: float) -> str:
+            """Wait for `target` OR a user STOP, whichever fires first, bounded
+            by `timeout`. Returns 'ok' (target set), 'stop' (user stopped), or
+            'timeout'. Makes the blocking pause points (plan-review gate, task
+            feedback) responsive to STOP instead of ignoring it."""
+            tgt = asyncio.ensure_future(target.wait())
+            stp = asyncio.ensure_future(self._stop_event.wait())
+            try:
+                done, pending = await asyncio.wait(
+                    {tgt, stp}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for p in pending:
+                    p.cancel()
+            if self._stop_event.is_set():
+                return "stop"
+            if tgt in done:
+                return "ok"
+            return "timeout"
+
+
         # Model availability whitelist (the dashboard's fetched catalogue):
         # the planner may only reference these, and every assignment is
         # validated against it before any wave runs. Empty/None disables it.
@@ -305,10 +326,20 @@ class AI_TEAM_ORCHESTRATOR:
             print(f"[PAUSE] Task {task.task_id} awaits user feedback: {question[:80]}")
 
             timed_out = False
-            try:
-                await asyncio.wait_for(event.wait(), timeout=FEEDBACK_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                timed_out = True
+            outcome = await _race_stop(event, FEEDBACK_TIMEOUT_SECONDS)
+            if outcome == "stop":
+                # User hit STOP while a task was parked for input: abandon the
+                # wait, fail this task, and let the run-level stop checks halt
+                # the rest of the pipeline.
+                self._feedback_requests.pop(task.task_id, None)
+                task.status = "failed"
+                await send_event("task_input_timeout", {
+                    "task_id": task.task_id,
+                    "task_index": idx,
+                    "reason": "stopped by user",
+                })
+                return None
+            timed_out = outcome == "timeout"
 
             self._feedback_requests.pop(task.task_id, None)
             feedback = entry["text"]
@@ -352,7 +383,7 @@ class AI_TEAM_ORCHESTRATOR:
             db.add(run_model)
             db.commit()
 
-            await send_event("execution_started", {"goal": goal})
+            await send_event("execution_started", {"goal": goal, "run_id": self.state.run_id})
             print(f"\n[INFO] Processing goal: '{goal}'")
             self.state.current_goal = goal
             self.state.status = "running"
@@ -422,6 +453,7 @@ class AI_TEAM_ORCHESTRATOR:
                     {
                         "task_id": t.task_id,
                         "task_index": i,
+                        "role": t.role,
                         "description": t.description,
                         "depends_on": list(t.dependencies),
                         "planner_model": t.model_override or "auto",
@@ -448,6 +480,8 @@ class AI_TEAM_ORCHESTRATOR:
 
             completed_tasks: List[Task] = []
             outputs_by_id: Dict[str, str] = {}
+            # M22: run-wide token meter (provider-reported, successful calls).
+            run_tok = {"prompt": 0, "completion": 0}
             known_ids = {t.task_id for t in plan_result.tasks}
             task_index_by_id = {
                 t.task_id: i for i, t in enumerate(plan_result.tasks, 1)
@@ -509,6 +543,7 @@ class AI_TEAM_ORCHESTRATOR:
                         {
                             "task_id": t.task_id,
                             "task_index": task_index_by_id[t.task_id],
+                            "role": t.role,
                             "description": t.description,
                             "depends_on": effective_dependencies(t, known_ids),
                             "planner_model": t.model_override or "auto",
@@ -520,15 +555,26 @@ class AI_TEAM_ORCHESTRATOR:
                 print("[PAUSE] Plan review requested; awaiting per-task model assignments")
 
                 review_timed_out = False
-                try:
-                    await asyncio.wait_for(
-                        review_event.wait(), timeout=FEEDBACK_TIMEOUT_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    review_timed_out = True
-
+                review_outcome = await _race_stop(
+                    review_event, FEEDBACK_TIMEOUT_SECONDS
+                )
                 assignments = (self._plan_review or {}).get("assignments") or {}
                 self._plan_review = None
+
+                if review_outcome == "stop":
+                    # STOP pressed during the review pause: cancel the run
+                    # instead of sitting in AWAITING REVIEW forever.
+                    if run_model is not None:
+                        run_model.status = "failed"
+                        run_model.finished_at = datetime.utcnow()
+                        db.commit()
+                    self.state.status = "failed"
+                    await send_event("execution_failed", {
+                        "error": "stopped by user during plan review"
+                    })
+                    return {"error": "stopped by user", "status": "stopped"}
+
+                review_timed_out = review_outcome == "timeout"
                 if run_model is not None:
                     run_model.status = "running"
                     db.commit()
@@ -691,12 +737,26 @@ class AI_TEAM_ORCHESTRATOR:
 
                 appended = False
                 for sm_idx, step_model in enumerate(step_models):
+                    if self._stop_event.is_set():
+                        task.status = "failed"
+                        if not appended:
+                            completed_tasks.append(task)
+                            appended = True
+                        await send_event("task_worker_failed", {
+                            "task_index": idx, "task_id": task.task_id,
+                            "error": "stopped by user",
+                        })
+                        return
                     can_rotate = sm_idx < len(step_models) - 1
                     task.model_override = step_model
                     rotate_reason = "worker failed"
                     worker_result = None
 
                     for attempt in range(1, 4):  # up to 3 attempts per model
+                        if self._stop_event.is_set():
+                            worker_result = None
+                            rotate_reason = "stopped by user"
+                            break
                         try:
                             # WorkerAgent.execute() already validates the JSON
                             # output via _parse_result() — raw_output is the
@@ -785,15 +845,25 @@ class AI_TEAM_ORCHESTRATOR:
                         completed_tasks.append(task)
                         appended = True
 
+                    run_tok["prompt"] += worker_result.prompt_tokens
+                    run_tok["completion"] += worker_result.completion_tokens
                     await send_event("task_worker_completed", {
                         "task_index": idx,
                         "task_id": task.task_id,
                         "output": worker_result.raw_output,
                         "attempts": task.attempts,
                         "model": step_model,
+                        "prompt_tokens": worker_result.prompt_tokens,
+                        "completion_tokens": worker_result.completion_tokens,
                     })
                     print(f"[OK] Task {idx} completed")
                     print(f"   Output: {worker_result.raw_output[:100]}...")
+
+                    # STOP honoured before spending a reviewer call: the worker
+                    # output stands (task already appended as completed), but we
+                    # skip review/retry and let the run-level checks halt.
+                    if self._stop_event.is_set():
+                        break
 
                     # Step 3: Reviewer validates task output
                     await send_event("task_review_started", {
@@ -826,11 +896,15 @@ class AI_TEAM_ORCHESTRATOR:
                         task.status = "failed"
                         return
 
+                    run_tok["prompt"] += review_result.prompt_tokens
+                    run_tok["completion"] += review_result.completion_tokens
                     if review_result.is_valid:
                         await send_event("task_review_passed", {
                             "task_index": idx,
                             "task_id": task.task_id,
-                            "feedback": review_result.feedback
+                            "feedback": review_result.feedback,
+                            "prompt_tokens": review_result.prompt_tokens,
+                            "completion_tokens": review_result.completion_tokens,
                         })
                         print("[OK] Task approved by reviewer")
                         break  # step passed on this model
@@ -838,9 +912,17 @@ class AI_TEAM_ORCHESTRATOR:
                     await send_event("task_review_failed", {
                         "task_index": idx,
                         "task_id": task.task_id,
-                        "feedback": review_result.feedback
+                        "feedback": review_result.feedback,
+                        "prompt_tokens": review_result.prompt_tokens,
+                        "completion_tokens": review_result.completion_tokens,
                     })
                     print(f"[FAIL] Task rejected: {review_result.feedback}")
+
+                    # STOP honoured before any retry/rotation: don't spend
+                    # another worker+review cycle on a run the user abandoned.
+                    if self._stop_event.is_set():
+                        task.status = "rejected"
+                        break
 
                     # Milestone 9: reviewer declined to decide — ask the user.
                     retry_reason = None
@@ -873,11 +955,18 @@ class AI_TEAM_ORCHESTRATOR:
                             task.output = retry_result.raw_output
                             task.attempts = 2
                             outputs_by_id[task.task_id] = retry_result.raw_output
+                            run_tok["prompt"] += retry_result.prompt_tokens + retry_review.prompt_tokens
+                            run_tok["completion"] += retry_result.completion_tokens + retry_review.completion_tokens
+                            retry_tokens = {
+                                "prompt_tokens": retry_result.prompt_tokens + retry_review.prompt_tokens,
+                                "completion_tokens": retry_result.completion_tokens + retry_review.completion_tokens,
+                            }
                             if retry_review.is_valid:
                                 await send_event("task_retry_review_passed", {
                                     "task_index": idx,
                                     "task_id": task.task_id,
-                                    "feedback": retry_review.feedback
+                                    "feedback": retry_review.feedback,
+                                    **retry_tokens,
                                 })
                                 print("[OK] Task approved after retry")
                                 task.status = "approved_after_retry"
@@ -885,7 +974,8 @@ class AI_TEAM_ORCHESTRATOR:
                             await send_event("task_retry_review_failed", {
                                 "task_index": idx,
                                 "task_id": task.task_id,
-                                "feedback": retry_review.feedback
+                                "feedback": retry_review.feedback,
+                                **retry_tokens,
                             })
                             rotate_reason = f"reviewer rejected: {retry_review.feedback}"
                         except (ProviderError, Exception) as e:
@@ -954,6 +1044,20 @@ class AI_TEAM_ORCHESTRATOR:
                     *(run_task(t, task_index_by_id[t.task_id]) for t in wave)
                 )
 
+            # STOP honoured at the very end: if the user abandoned the run at
+            # any point (even during the last wave's only task), report it as
+            # stopped rather than announcing RUN COMPLETE.
+            if self._stop_event.is_set():
+                self.state.status = "failed"
+                if run_model is not None:
+                    run_model.status = "failed"
+                    run_model.finished_at = datetime.utcnow()
+                    db.commit()
+                await send_event("execution_failed", {
+                    "error": "stopped by user"
+                })
+                return {"error": "stopped by user", "status": "stopped"}
+
             # Step 4: Generate final output summary metrics
             print("\n[INFO] Execution completed!")
             print("\n=== FINAL OUTPUT ===")
@@ -1014,6 +1118,7 @@ class AI_TEAM_ORCHESTRATOR:
                 "completed_tasks": completed_count,
                 "rejected_tasks": rejected_count,
                 "status": "completed",
+                "total_tokens": run_tok,
             }
             await send_event("run_completed", {
                 "final_output": final_output,

@@ -76,6 +76,8 @@ Evaluate the worker output. Is it correct, complete, and properly formatted? Pro
         )
 
         review = self._parse_result(response.content)
+        review.prompt_tokens = response.prompt_tokens
+        review.completion_tokens = response.completion_tokens
         return review
 
     def _parse_result(self, raw_text: str) -> ReviewResult:
