@@ -44,7 +44,7 @@ verified by executed evidence, not vibes.
   release. Or pre-assign slots before pressing ENGAGE and never pause at all.
 - **STOP** button halts cleanly at the next task boundary.
 
-### The console (a.k.a. the JARVIS part)
+### The console
 Live DAG canvas with flowing signal edges, per-node status states, tool-call
 badges, retry/rotation traces, an inspector drawer, a scrolling event feed, and
 a final deliverable modal — all driven by one pure per-frame reducer over the
