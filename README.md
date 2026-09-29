@@ -37,7 +37,7 @@ verified by executed evidence, not vibes.
   tool calling? Degrade to plain completion. Dead key? You get a clear message,
   not a stack trace.
 
-### Human-in-the-loop, for real
+### Human-in-the-loop
 - Planner or reviewer can **pause a task** and ask you — with the upstream
   results shown in the approval widget so you're choosing with context.
 - **Review-plan gate**: hold after planning, re-assign models per node, then
